@@ -65,7 +65,7 @@ impl App {
         let old_rx = self.network_stats.rx_bytes;
         let old_tx = self.network_stats.tx_bytes;
 
-        self.networks.refresh();
+        self.networks.refresh(true);
         let mut total_rx = 0;
         let mut total_tx = 0;
 
@@ -116,15 +116,18 @@ fn main() -> Result<(), io::Error> {
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-) -> io::Result<()> {
+) -> Result<(), B::Error>
+where
+    B::Error: From<io::Error>,
+{
     loop {
         app.update();
         terminal.draw(|f| ui(f, app))?;
 
-        if event::poll(Duration::from_millis(1000))? {
-            if let Event::Key(key) = event::read()? {
-                app.on_key(key.code);
-            }
+        if event::poll(Duration::from_millis(1000))?
+            && let Event::Key(key) = event::read()?
+        {
+            app.on_key(key.code);
         }
 
         if app.should_quit {
