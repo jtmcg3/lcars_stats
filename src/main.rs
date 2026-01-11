@@ -1,36 +1,27 @@
+mod apple_silicon;
+mod lcars_widgets;
+
+use apple_silicon::{AppleSiliconStats, MacmonCollector};
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use lcars_widgets::*;
 use ratatui::{
     backend::CrosstermBackend,
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph},
+    widgets::{Paragraph, Widget},
     Frame, Terminal,
 };
 use std::io;
 use std::time::Duration;
-use sysinfo::{Networks, System};
+use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
 
-// LCARS color palette
-const LCARS_ORANGE: Color = Color::Rgb(255, 153, 0);
-const LCARS_BLUE: Color = Color::Rgb(153, 153, 255);
-const LCARS_PURPLE: Color = Color::Rgb(204, 153, 255);
-const LCARS_PEACH: Color = Color::Rgb(255, 204, 153);
-const LCARS_RED: Color = Color::Rgb(204, 102, 102);
-const LCARS_YELLOW: Color = Color::Rgb(255, 255, 153);
-const LCARS_BG: Color = Color::Black;
-
-struct App {
-    sys: System,
-    networks: Networks,
-    should_quit: bool,
-    network_stats: NetworkStats,
-}
-
+/// Network statistics tracking
 struct NetworkStats {
     rx_bytes: u64,
     tx_bytes: u64,
@@ -38,15 +29,54 @@ struct NetworkStats {
     tx_speed: f64,
 }
 
+/// Disk I/O statistics
+struct DiskStats {
+    read_bytes: u64,
+    write_bytes: u64,
+    read_speed: f64,
+    write_speed: f64,
+}
+
+/// Top process information
+#[derive(Clone)]
+struct ProcessInfo {
+    name: String,
+    cpu_percent: f32,
+    memory_bytes: u64,
+}
+
+/// Main application state
+struct App {
+    sys: System,
+    networks: Networks,
+    disks: Disks,
+    should_quit: bool,
+    network_stats: NetworkStats,
+    disk_stats: DiskStats,
+    macmon: Option<MacmonCollector>,
+    apple_stats: AppleSiliconStats,
+    top_processes: Vec<ProcessInfo>,
+}
+
 impl App {
     fn new() -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
         let networks = Networks::new_with_refreshed_list();
+        let disks = Disks::new_with_refreshed_list();
+
+        // Try to start macmon collector
+        let macmon = MacmonCollector::new();
+        let apple_stats = if macmon.is_some() {
+            AppleSiliconStats::default()
+        } else {
+            AppleSiliconStats::unavailable()
+        };
 
         Self {
             sys,
             networks,
+            disks,
             should_quit: false,
             network_stats: NetworkStats {
                 rx_bytes: 0,
@@ -54,21 +84,30 @@ impl App {
                 rx_speed: 0.0,
                 tx_speed: 0.0,
             },
+            disk_stats: DiskStats {
+                read_bytes: 0,
+                write_bytes: 0,
+                read_speed: 0.0,
+                write_speed: 0.0,
+            },
+            macmon,
+            apple_stats,
+            top_processes: Vec::new(),
         }
     }
 
     fn update(&mut self) {
         self.sys.refresh_cpu_all();
         self.sys.refresh_memory();
+        self.sys.refresh_processes(ProcessesToUpdate::All, true);
 
-        // Calculate network stats
+        // Update network stats
         let old_rx = self.network_stats.rx_bytes;
         let old_tx = self.network_stats.tx_bytes;
-
         self.networks.refresh(true);
+
         let mut total_rx = 0;
         let mut total_tx = 0;
-
         for (_name, network) in &self.networks {
             total_rx += network.total_received();
             total_tx += network.total_transmitted();
@@ -76,12 +115,60 @@ impl App {
 
         self.network_stats.rx_bytes = total_rx;
         self.network_stats.tx_bytes = total_tx;
-
-        // Calculate speeds (bytes per second)
         if old_rx > 0 {
             self.network_stats.rx_speed = (total_rx.saturating_sub(old_rx)) as f64;
             self.network_stats.tx_speed = (total_tx.saturating_sub(old_tx)) as f64;
         }
+
+        // Update disk stats
+        let old_read = self.disk_stats.read_bytes;
+        let old_write = self.disk_stats.write_bytes;
+        self.disks.refresh(true);
+
+        let mut total_read = 0u64;
+        let mut total_write = 0u64;
+        // Note: sysinfo doesn't provide per-disk I/O rates directly
+        // We'll estimate from process I/O if available
+        for process in self.sys.processes().values() {
+            let disk_usage = process.disk_usage();
+            total_read = total_read.saturating_add(disk_usage.total_read_bytes);
+            total_write = total_write.saturating_add(disk_usage.total_written_bytes);
+        }
+
+        self.disk_stats.read_bytes = total_read;
+        self.disk_stats.write_bytes = total_write;
+        if old_read > 0 {
+            self.disk_stats.read_speed = (total_read.saturating_sub(old_read)) as f64;
+            self.disk_stats.write_speed = (total_write.saturating_sub(old_write)) as f64;
+        }
+
+        // Update Apple Silicon stats from macmon
+        if let Some(ref mut collector) = self.macmon {
+            let metrics = collector.get_latest();
+            self.apple_stats = AppleSiliconStats::from_macmon(metrics);
+        }
+
+        // Update top processes
+        self.update_top_processes();
+    }
+
+    fn update_top_processes(&mut self) {
+        let mut processes: Vec<ProcessInfo> = self
+            .sys
+            .processes()
+            .values()
+            .map(|p| ProcessInfo {
+                name: p.name().to_string_lossy().to_string(),
+                cpu_percent: p.cpu_usage(),
+                memory_bytes: p.memory(),
+            })
+            .collect();
+
+        // Sort by CPU usage descending
+        processes.sort_by(|a, b| b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Keep top 5
+        self.top_processes = processes.into_iter().take(5).collect();
     }
 
     fn on_key(&mut self, key: KeyCode) {
@@ -139,139 +226,325 @@ where
 fn ui(f: &mut Frame, app: &App) {
     let size = f.area();
 
-    // Main layout
-    let chunks = Layout::default()
+    // Main layout: header, content, footer
+    let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),  // Header
-            Constraint::Min(0),     // Main content
+            Constraint::Min(0),     // Content
             Constraint::Length(2),  // Footer
         ])
         .split(size);
 
-    // Header
-    render_header(f, chunks[0]);
+    // Render header
+    let stardate = format!("{:.2}", chrono::Local::now().timestamp() as f64 / 86400.0 + 2451545.0);
+    let header = LcarsHeader::new("ENGINEERING", &stardate);
+    f.render_widget(header, main_chunks[0]);
 
-    // Main content area
+    // Content area: sidebar + main panels
     let content_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(8),   // Sidebar
+            Constraint::Min(0),      // Main content
+        ])
+        .split(main_chunks[1]);
+
+    // Render sidebar
+    render_sidebar(f, content_chunks[0], app);
+
+    // Main content panels
+    let panel_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(40),  // CPU cores
-            Constraint::Percentage(20),  // RAM
-            Constraint::Percentage(20),  // Swap
-            Constraint::Percentage(20),  // Network
+            Constraint::Length(5),   // CPU clusters (WARP NACELLES)
+            Constraint::Length(5),   // GPU (PLASMA CONDUIT)
+            Constraint::Length(4),   // ANE (NEURAL MATRIX)
+            Constraint::Length(5),   // Power (REACTOR OUTPUT)
+            Constraint::Length(4),   // Thermal (ENVIRONMENTAL)
+            Constraint::Length(4),   // Memory (SHIELD CAPACITY)
+            Constraint::Length(5),   // Network (SUBSPACE ARRAY)
+            Constraint::Length(4),   // Disk (CARGO TRANSPORT)
+            Constraint::Min(0),      // Processes (SENSOR ARRAY)
         ])
-        .split(chunks[1]);
+        .split(content_chunks[1]);
 
-    // Render each section
-    render_warp_cores(f, content_chunks[0], app);
-    render_shields(f, content_chunks[1], app);
-    render_cargo_bay(f, content_chunks[2], app);
-    render_subspace(f, content_chunks[3], app);
+    // Render each panel
+    render_warp_nacelles(f, panel_chunks[0], app);
+    render_plasma_conduit(f, panel_chunks[1], app);
+    render_neural_matrix(f, panel_chunks[2], app);
+    render_reactor_output(f, panel_chunks[3], app);
+    render_environmental(f, panel_chunks[4], app);
+    render_shield_capacity(f, panel_chunks[5], app);
+    render_subspace_array(f, panel_chunks[6], app);
+    render_cargo_transport(f, panel_chunks[7], app);
+    render_sensor_array(f, panel_chunks[8], app);
 
-    // Footer
-    render_footer(f, chunks[2]);
+    // Render footer
+    let footer = LcarsFooter::new(
+        &[("[Q]", "TERMINATE", LCARS_ORANGE), ("[R]", "REFRESH", LCARS_BLUE)],
+        &app.apple_stats.thermal_status,
+    );
+    f.render_widget(footer, main_chunks[2]);
 }
 
-fn render_header(f: &mut Frame, area: Rect) {
-    let stardate = format!("{:.2}", chrono::Local::now().timestamp() as f64 / 86400.0 + 2451545.0);
-    let header_text = vec![
-        Line::from(vec![
-            Span::styled("╔═══════════════════════════════════════════════════════════════════════════════╗", Style::default().fg(LCARS_ORANGE)),
-        ]),
-        Line::from(vec![
-            Span::styled("║  ", Style::default().fg(LCARS_ORANGE)),
-            Span::styled("█████", Style::default().fg(LCARS_ORANGE).bg(LCARS_ORANGE)),
-            Span::styled("  LCARS SYSTEM MONITOR  ", Style::default().fg(LCARS_ORANGE).add_modifier(Modifier::BOLD)),
-            Span::styled("█████", Style::default().fg(LCARS_BLUE).bg(LCARS_BLUE)),
-            Span::styled("  STARDATE ", Style::default().fg(LCARS_BLUE)),
-            Span::styled(stardate, Style::default().fg(LCARS_YELLOW)),
-            Span::styled("  ║", Style::default().fg(LCARS_ORANGE)),
-        ]),
-        Line::from(vec![
-            Span::styled("╚═══════════════════════════════════════════════════════════════════════════════╝", Style::default().fg(LCARS_ORANGE)),
-        ]),
-    ];
-
-    let header = Paragraph::new(header_text).style(Style::default().bg(LCARS_BG));
-    f.render_widget(header, area);
+/// LCARS Header widget
+struct LcarsHeader {
+    title: String,
+    stardate: String,
 }
 
-fn render_warp_cores(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(LCARS_ORANGE))
-        .title(Span::styled(" ◆ WARP CORES ◆ ", Style::default().fg(LCARS_ORANGE).add_modifier(Modifier::BOLD)))
-        .style(Style::default().bg(LCARS_BG));
-
-    let inner_area = block.inner(area);
-    f.render_widget(block, area);
-
-    let cpus = app.sys.cpus();
-    let cpu_count = cpus.len();
-
-    if cpu_count == 0 {
-        return;
-    }
-
-    // Calculate layout for CPU cores
-    let cores_per_row = 4;
-    let rows = cpu_count.div_ceil(cores_per_row);
-
-    let mut constraints = vec![];
-    for _ in 0..rows {
-        constraints.push(Constraint::Length(3));
-    }
-    if rows < (inner_area.height / 3) as usize {
-        constraints.push(Constraint::Min(0));
-    }
-
-    let row_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(inner_area);
-
-    for (row_idx, row_area) in row_chunks.iter().enumerate().take(rows) {
-        let start_idx = row_idx * cores_per_row;
-        let end_idx = (start_idx + cores_per_row).min(cpu_count);
-        let cores_in_row = end_idx - start_idx;
-
-        let col_constraints: Vec<Constraint> = (0..cores_in_row)
-            .map(|_| Constraint::Percentage((100 / cores_in_row) as u16))
-            .collect();
-
-        let col_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(col_constraints)
-            .split(*row_area);
-
-        for (col_idx, col_area) in col_chunks.iter().enumerate().take(cores_in_row) {
-            let cpu_idx = start_idx + col_idx;
-            if let Some(cpu) = cpus.get(cpu_idx) {
-                let usage = cpu.cpu_usage();
-                let color = get_usage_color(usage as u16);
-
-                let gauge = Gauge::default()
-                    .block(Block::default())
-                    .gauge_style(Style::default().fg(color).bg(LCARS_BG))
-                    .label(format!("C{} {:.0}%", cpu_idx, usage))
-                    .ratio(f64::from(usage) / 100.0);
-
-                f.render_widget(gauge, *col_area);
-            }
+impl LcarsHeader {
+    fn new(title: &str, stardate: &str) -> Self {
+        Self {
+            title: title.to_string(),
+            stardate: stardate.to_string(),
         }
     }
 }
 
-fn render_shields(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(LCARS_BLUE))
-        .title(Span::styled(" ◆ SHIELD CAPACITY ◆ ", Style::default().fg(LCARS_BLUE).add_modifier(Modifier::BOLD)))
-        .style(Style::default().bg(LCARS_BG));
+impl Widget for LcarsHeader {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        draw_lcars_header(buf, area, &self.title, &self.stardate);
+    }
+}
 
-    let inner_area = block.inner(area);
-    f.render_widget(block, area);
+/// LCARS Footer widget
+struct LcarsFooter {
+    items: Vec<(String, String, ratatui::style::Color)>,
+    status: String,
+}
+
+impl LcarsFooter {
+    fn new(items: &[(&str, &str, ratatui::style::Color)], status: &str) -> Self {
+        Self {
+            items: items.iter().map(|(k, v, c)| (k.to_string(), v.to_string(), *c)).collect(),
+            status: status.to_string(),
+        }
+    }
+}
+
+impl Widget for LcarsFooter {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let items: Vec<(&str, ratatui::style::Color)> = self.items
+            .iter()
+            .map(|(k, v, c)| {
+                let combined = format!("{} {}", k, v);
+                // We need to leak this string to get a static lifetime
+                // This is a hack but works for our use case
+                (Box::leak(combined.into_boxed_str()) as &str, *c)
+            })
+            .collect();
+        draw_lcars_footer(buf, area, &items, &self.status);
+    }
+}
+
+fn render_sidebar(f: &mut Frame, area: Rect, _app: &App) {
+    // Define sidebar buttons aligned with content panel heights
+    // Heights must match: 5, 5, 4, 5, 4, 4, 5, 4, Min(remaining)
+    let buttons = [
+        ("CPU", LCARS_ORANGE, 5u16),     // WARP NACELLES
+        ("GPU", LCARS_BLUE, 5u16),       // PLASMA CONDUIT
+        ("ANE", LCARS_PURPLE, 4u16),     // NEURAL MATRIX
+        ("PWR", LCARS_PEACH, 5u16),      // REACTOR OUTPUT
+        ("TMP", LCARS_YELLOW, 4u16),     // ENVIRONMENTAL
+        ("MEM", LCARS_BLUE, 4u16),       // SHIELD CAPACITY
+        ("NET", LCARS_PEACH, 5u16),      // SUBSPACE ARRAY
+        ("DSK", LCARS_PURPLE, 4u16),     // CARGO TRANSPORT
+        ("PRC", LCARS_TAN, 0u16),        // SENSOR ARRAY (fills remaining)
+    ];
+
+    let mut y_offset = 0u16;
+
+    for (label, color, height) in &buttons {
+        let btn_height = if *height == 0 {
+            // Last button fills remaining space
+            area.height.saturating_sub(y_offset)
+        } else {
+            *height
+        };
+
+        if y_offset + btn_height <= area.height {
+            let button_area = Rect {
+                x: area.x,
+                y: area.y + y_offset,
+                width: area.width,
+                height: btn_height,
+            };
+            let button = LcarsSidebarButton::new(label, *color);
+            f.render_widget(button, button_area);
+        }
+        y_offset += btn_height;
+    }
+}
+
+fn render_warp_nacelles(f: &mut Frame, area: Rect, app: &App) {
+    let title = lcars_section_title("WARP NACELLES (CPU CLUSTERS)", LCARS_ORANGE);
+
+    let ecpu_pct = app.apple_stats.ecpu_usage_percent;
+    let pcpu_pct = app.apple_stats.pcpu_usage_percent;
+    let ecpu_freq = app.apple_stats.ecpu_freq_mhz;
+    let pcpu_freq = app.apple_stats.pcpu_freq_mhz;
+
+    let content = if app.apple_stats.available {
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(vec![
+                Span::styled("P-CLUSTER: ", Style::default().fg(LCARS_ORANGE)),
+                Span::styled(format!("{:.0}%", pcpu_pct), Style::default().fg(get_usage_color(pcpu_pct))),
+                Span::styled(format!("  @ {:.0} MHz", pcpu_freq), Style::default().fg(LCARS_YELLOW)),
+            ]),
+            Line::from(vec![
+                Span::styled("E-CLUSTER: ", Style::default().fg(LCARS_ORANGE)),
+                Span::styled(format!("{:.0}%", ecpu_pct), Style::default().fg(get_usage_color(ecpu_pct))),
+                Span::styled(format!("  @ {:.0} MHz", ecpu_freq), Style::default().fg(LCARS_YELLOW)),
+            ]),
+        ]
+    } else {
+        // Fallback to aggregate CPU from sysinfo
+        let cpu_usage: f32 = app.sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / app.sys.cpus().len() as f32;
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(vec![
+                Span::styled("AGGREGATE: ", Style::default().fg(LCARS_ORANGE)),
+                Span::styled(format!("{:.0}%", cpu_usage), Style::default().fg(get_usage_color(cpu_usage as f64))),
+                Span::styled(" (macmon unavailable)", Style::default().fg(LCARS_PEACH)),
+            ]),
+        ]
+    };
+
+    let para = Paragraph::new(content).style(Style::default().bg(LCARS_BG));
+    f.render_widget(para, area);
+}
+
+fn render_plasma_conduit(f: &mut Frame, area: Rect, app: &App) {
+    let title = lcars_section_title("PLASMA CONDUIT (GPU)", LCARS_BLUE);
+
+    let content = if app.apple_stats.available {
+        let gpu_pct = app.apple_stats.gpu_usage_percent;
+        let gpu_freq = app.apple_stats.gpu_freq_mhz;
+        let gpu_power = app.apple_stats.gpu_power_w;
+
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(vec![
+                Span::styled("UTILIZATION: ", Style::default().fg(LCARS_BLUE)),
+                Span::styled(format!("{:.0}%", gpu_pct), Style::default().fg(get_usage_color(gpu_pct))),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("FREQ: {:.0} MHz  POWER: {:.1}W", gpu_freq, gpu_power), Style::default().fg(LCARS_YELLOW)),
+            ]),
+        ]
+    } else {
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(Span::styled("GPU metrics require macmon", Style::default().fg(LCARS_PEACH))),
+        ]
+    };
+
+    let para = Paragraph::new(content).style(Style::default().bg(LCARS_BG));
+    f.render_widget(para, area);
+}
+
+fn render_neural_matrix(f: &mut Frame, area: Rect, app: &App) {
+    let title = lcars_section_title("NEURAL MATRIX (ANE)", LCARS_PURPLE);
+
+    let content = if app.apple_stats.available {
+        let ane_power = app.apple_stats.ane_power_w;
+        let status = if ane_power > 0.1 { "ACTIVE" } else { "STANDBY" };
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(vec![
+                Span::styled("POWER: ", Style::default().fg(LCARS_PURPLE)),
+                Span::styled(format!("{:.2}W", ane_power), Style::default().fg(LCARS_YELLOW)),
+                Span::styled(format!("   STATUS: {}", status), Style::default().fg(if ane_power > 0.1 { LCARS_BLUE } else { LCARS_PEACH })),
+            ]),
+        ]
+    } else {
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(Span::styled("ANE metrics require macmon", Style::default().fg(LCARS_PEACH))),
+        ]
+    };
+
+    let para = Paragraph::new(content).style(Style::default().bg(LCARS_BG));
+    f.render_widget(para, area);
+}
+
+fn render_reactor_output(f: &mut Frame, area: Rect, app: &App) {
+    let title = lcars_section_title("REACTOR OUTPUT (POWER)", LCARS_PEACH);
+
+    let content = if app.apple_stats.available {
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(vec![
+                Span::styled("CPU: ", Style::default().fg(LCARS_ORANGE)),
+                Span::styled(format!("{:.1}W", app.apple_stats.cpu_power_w), Style::default().fg(LCARS_YELLOW)),
+                Span::styled("  GPU: ", Style::default().fg(LCARS_BLUE)),
+                Span::styled(format!("{:.1}W", app.apple_stats.gpu_power_w), Style::default().fg(LCARS_YELLOW)),
+            ]),
+            Line::from(vec![
+                Span::styled("ANE: ", Style::default().fg(LCARS_PURPLE)),
+                Span::styled(format!("{:.1}W", app.apple_stats.ane_power_w), Style::default().fg(LCARS_YELLOW)),
+                Span::styled("  TOTAL: ", Style::default().fg(LCARS_PEACH)),
+                Span::styled(format!("{:.1}W", app.apple_stats.sys_power_w), Style::default().fg(LCARS_YELLOW).add_modifier(Modifier::BOLD)),
+            ]),
+        ]
+    } else {
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(Span::styled("Power metrics require macmon", Style::default().fg(LCARS_PEACH))),
+        ]
+    };
+
+    let para = Paragraph::new(content).style(Style::default().bg(LCARS_BG));
+    f.render_widget(para, area);
+}
+
+fn render_environmental(f: &mut Frame, area: Rect, app: &App) {
+    let title = lcars_section_title("ENVIRONMENTAL CONTROLS (THERMAL)", LCARS_YELLOW);
+
+    let content = if app.apple_stats.available {
+        let cpu_temp = app.apple_stats.cpu_temp_c;
+        let gpu_temp = app.apple_stats.gpu_temp_c;
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(vec![
+                Span::styled("CPU: ", Style::default().fg(LCARS_ORANGE)),
+                Span::styled(format!("{:.0}°C", cpu_temp), Style::default().fg(get_temp_color(cpu_temp))),
+                Span::styled("  GPU: ", Style::default().fg(LCARS_BLUE)),
+                Span::styled(format!("{:.0}°C", gpu_temp), Style::default().fg(get_temp_color(gpu_temp))),
+                Span::styled("  STATUS: ", Style::default().fg(LCARS_PEACH)),
+                Span::styled(&app.apple_stats.thermal_status, Style::default().fg(
+                    if app.apple_stats.thermal_status == "NOMINAL" { LCARS_BLUE }
+                    else if app.apple_stats.thermal_status == "ELEVATED" { LCARS_YELLOW }
+                    else { LCARS_RED }
+                ).add_modifier(Modifier::BOLD)),
+            ]),
+        ]
+    } else {
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(Span::styled("Temperature metrics require macmon", Style::default().fg(LCARS_PEACH))),
+        ]
+    };
+
+    let para = Paragraph::new(content).style(Style::default().bg(LCARS_BG));
+    f.render_widget(para, area);
+}
+
+fn render_shield_capacity(f: &mut Frame, area: Rect, app: &App) {
+    let title = lcars_section_title("SHIELD CAPACITY (MEMORY)", LCARS_BLUE);
 
     let total_mem = app.sys.total_memory();
     let used_mem = app.sys.used_memory();
@@ -281,115 +554,88 @@ fn render_shields(f: &mut Frame, area: Rect, app: &App) {
         0.0
     };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
-        .split(inner_area);
-
-    let color = get_usage_color(percent as u16);
-    let gauge = Gauge::default()
-        .block(Block::default())
-        .gauge_style(Style::default().fg(color).bg(LCARS_BG))
-        .label(format!("{:.1}% ({:.2} GB / {:.2} GB)",
-            percent,
-            used_mem as f64 / 1_073_741_824.0,
-            total_mem as f64 / 1_073_741_824.0))
-        .ratio(percent / 100.0);
-
-    f.render_widget(gauge, chunks[0]);
-}
-
-fn render_cargo_bay(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(LCARS_PURPLE))
-        .title(Span::styled(" ◆ CARGO BAY ◆ ", Style::default().fg(LCARS_PURPLE).add_modifier(Modifier::BOLD)))
-        .style(Style::default().bg(LCARS_BG));
-
-    let inner_area = block.inner(area);
-    f.render_widget(block, area);
-
-    let total_swap = app.sys.total_swap();
-    let used_swap = app.sys.used_swap();
-    let percent = if total_swap > 0 {
-        (used_swap as f64 / total_swap as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
-        .split(inner_area);
-
-    let color = get_usage_color(percent as u16);
-    let gauge = Gauge::default()
-        .block(Block::default())
-        .gauge_style(Style::default().fg(color).bg(LCARS_BG))
-        .label(format!("{:.1}% ({:.2} GB / {:.2} GB)",
-            percent,
-            used_swap as f64 / 1_073_741_824.0,
-            total_swap as f64 / 1_073_741_824.0))
-        .ratio(percent / 100.0);
-
-    f.render_widget(gauge, chunks[0]);
-}
-
-fn render_subspace(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(LCARS_PEACH))
-        .title(Span::styled(" ◆ SUBSPACE ARRAY ◆ ", Style::default().fg(LCARS_PEACH).add_modifier(Modifier::BOLD)))
-        .style(Style::default().bg(LCARS_BG));
-
-    let inner_area = block.inner(area);
-    f.render_widget(block, area);
-
-    let rx_mb = app.network_stats.rx_bytes as f64 / 1_048_576.0;
-    let tx_mb = app.network_stats.tx_bytes as f64 / 1_048_576.0;
-    let rx_speed_kb = app.network_stats.rx_speed / 1024.0;
-    let tx_speed_kb = app.network_stats.tx_speed / 1024.0;
-
-    let text = vec![
+    let content = vec![
+        Line::from(""), // Align with pill interior
+        title,
         Line::from(vec![
-            Span::styled("▼ RX: ", Style::default().fg(LCARS_YELLOW)),
-            Span::styled(format!("{:.2} MB", rx_mb), Style::default().fg(LCARS_BLUE)),
-            Span::styled("  [", Style::default().fg(LCARS_PEACH)),
-            Span::styled(format!("{:.1} KB/s", rx_speed_kb), Style::default().fg(LCARS_PURPLE)),
-            Span::styled("]", Style::default().fg(LCARS_PEACH)),
-        ]),
-        Line::from(vec![
-            Span::styled("▲ TX: ", Style::default().fg(LCARS_YELLOW)),
-            Span::styled(format!("{:.2} MB", tx_mb), Style::default().fg(LCARS_BLUE)),
-            Span::styled("  [", Style::default().fg(LCARS_PEACH)),
-            Span::styled(format!("{:.1} KB/s", tx_speed_kb), Style::default().fg(LCARS_PURPLE)),
-            Span::styled("]", Style::default().fg(LCARS_PEACH)),
+            Span::styled(format!("{:.1}%", percent), Style::default().fg(get_usage_color(percent))),
+            Span::styled(format!("  ({:.2} GB / {:.2} GB)",
+                used_mem as f64 / 1_073_741_824.0,
+                total_mem as f64 / 1_073_741_824.0), Style::default().fg(LCARS_YELLOW)),
         ]),
     ];
 
-    let paragraph = Paragraph::new(text).style(Style::default().bg(LCARS_BG));
-    f.render_widget(paragraph, inner_area);
+    let para = Paragraph::new(content).style(Style::default().bg(LCARS_BG));
+    f.render_widget(para, area);
 }
 
-fn render_footer(f: &mut Frame, area: Rect) {
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled("█", Style::default().fg(LCARS_ORANGE).bg(LCARS_ORANGE)),
-        Span::styled(" [Q/ESC] ", Style::default().fg(LCARS_ORANGE)),
-        Span::styled("TERMINATE  ", Style::default().fg(LCARS_YELLOW)),
-        Span::styled("█", Style::default().fg(LCARS_BLUE).bg(LCARS_BLUE)),
-        Span::styled(" SYSTEM STATUS: ", Style::default().fg(LCARS_BLUE)),
-        Span::styled("NOMINAL", Style::default().fg(LCARS_YELLOW).add_modifier(Modifier::BOLD)),
-    ]))
-    .style(Style::default().bg(LCARS_BG));
+fn render_subspace_array(f: &mut Frame, area: Rect, app: &App) {
+    let title = lcars_section_title("SUBSPACE ARRAY (NETWORK)", LCARS_PEACH);
 
-    f.render_widget(footer, area);
+    let rx_gb = app.network_stats.rx_bytes as f64 / 1_073_741_824.0;
+    let tx_gb = app.network_stats.tx_bytes as f64 / 1_073_741_824.0;
+    let rx_speed = app.network_stats.rx_speed / 1_048_576.0; // MB/s
+    let tx_speed = app.network_stats.tx_speed / 1_048_576.0;
+
+    let content = vec![
+        Line::from(""), // Align with pill interior
+        title,
+        Line::from(vec![
+            Span::styled("▼ RX: ", Style::default().fg(LCARS_YELLOW)),
+            Span::styled(format!("{:.2} GB", rx_gb), Style::default().fg(LCARS_BLUE)),
+            Span::styled(format!(" [{:.1} MB/s]", rx_speed), Style::default().fg(LCARS_PURPLE)),
+        ]),
+        Line::from(vec![
+            Span::styled("▲ TX: ", Style::default().fg(LCARS_YELLOW)),
+            Span::styled(format!("{:.2} GB", tx_gb), Style::default().fg(LCARS_BLUE)),
+            Span::styled(format!(" [{:.1} MB/s]", tx_speed), Style::default().fg(LCARS_PURPLE)),
+
+        ])
+    ];
+
+    let para = Paragraph::new(content).style(Style::default().bg(LCARS_BG));
+    f.render_widget(para, area);
 }
 
-fn get_usage_color(percent: u16) -> Color {
-    match percent {
-        0..=50 => LCARS_BLUE,
-        51..=75 => LCARS_YELLOW,
-        76..=90 => LCARS_PEACH,
-        _ => LCARS_RED,
+fn render_cargo_transport(f: &mut Frame, area: Rect, app: &App) {
+    let title = lcars_section_title("CARGO TRANSPORT (DISK I/O)", LCARS_PURPLE);
+
+    let read_speed = app.disk_stats.read_speed / 1_048_576.0; // MB/s
+    let write_speed = app.disk_stats.write_speed / 1_048_576.0;
+
+    let content = vec![
+        Line::from(""), // Align with pill interior
+        title,
+        Line::from(vec![
+            Span::styled("READ: ", Style::default().fg(LCARS_YELLOW)),
+            Span::styled(format!("{:.1} MB/s", read_speed), Style::default().fg(LCARS_BLUE)),
+            Span::styled("  WRITE: ", Style::default().fg(LCARS_YELLOW)),
+            Span::styled(format!("{:.1} MB/s", write_speed), Style::default().fg(LCARS_BLUE)),
+        ]),
+    ];
+
+    let para = Paragraph::new(content).style(Style::default().bg(LCARS_BG));
+    f.render_widget(para, area);
+}
+
+fn render_sensor_array(f: &mut Frame, area: Rect, app: &App) {
+    let title = lcars_section_title("SENSOR ARRAY (TOP PROCESSES)", LCARS_TAN);
+
+    let mut lines = vec![
+        Line::from(""), // Align with pill interior
+        title,
+    ];
+
+    for proc in &app.top_processes {
+        let name: String = proc.name.chars().take(15).collect();
+        let mem_mb = proc.memory_bytes as f64 / 1_048_576.0;
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<15}", name), Style::default().fg(LCARS_YELLOW)),
+            Span::styled(format!(" CPU: {:>5.1}%", proc.cpu_percent), Style::default().fg(get_usage_color(proc.cpu_percent as f64))),
+            Span::styled(format!("  MEM: {:>7.1} MB", mem_mb), Style::default().fg(LCARS_BLUE)),
+        ]));
     }
+
+    let para = Paragraph::new(lines).style(Style::default().bg(LCARS_BG));
+    f.render_widget(para, area);
 }

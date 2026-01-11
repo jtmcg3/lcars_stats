@@ -6,5 +6,7 @@ edition = "2024"
 [dependencies]
 ratatui = "0.30"
 crossterm = "0.29"
-sysinfo = "0.37"
+sysinfo = { version = "0.37", features = ["disk"] }
 chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
