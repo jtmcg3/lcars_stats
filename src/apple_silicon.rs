@@ -221,3 +221,58 @@ impl Drop for MacmonCollector {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CLASSIC_PIPE_JSON: &str = r#"{
+        "timestamp": "2026-03-29T20:59:59.337500+00:00",
+        "temp": { "cpu_temp_avg": 48.9, "gpu_temp_avg": 44.0 },
+        "ecpu_usage": [1902, 0.64],
+        "pcpu_usage": [2044, 0.02],
+        "gpu_usage": [338, 0.06],
+        "cpu_power": 0.89,
+        "gpu_power": 0.29,
+        "ane_power": 0.0,
+        "all_power": 1.19,
+        "sys_power": 16.4
+    }"#;
+
+    #[test]
+    fn default_metrics_are_not_available() {
+        let stats = AppleSiliconStats::from_macmon(&MacmonMetrics::default());
+        assert!(!stats.available);
+        assert_eq!(stats.thermal_status, "NO DATA");
+    }
+
+    #[test]
+    fn empty_json_deserializes_to_zeros_and_is_not_available() {
+        let metrics: MacmonMetrics =
+            serde_json::from_str("{}").expect("empty object should deserialize");
+        assert_eq!(metrics.cpu_power, 0.0);
+        assert_eq!(metrics.ecpu_usage, (0.0, 0.0));
+        let stats = AppleSiliconStats::from_macmon(&metrics);
+        assert!(!stats.available);
+        assert_eq!(stats.thermal_status, "NO DATA");
+    }
+
+    #[test]
+    fn collector_seed_default_is_not_live() {
+        let stats = AppleSiliconStats::from_macmon(&MacmonMetrics::default());
+        assert!(!stats.available);
+        assert_eq!(stats.thermal_status, "NO DATA");
+    }
+
+    #[test]
+    fn classic_pipe_json_is_live_with_sample_values() {
+        let metrics: MacmonMetrics =
+            serde_json::from_str(CLASSIC_PIPE_JSON).expect("classic macmon JSON");
+        let stats = AppleSiliconStats::from_macmon(&metrics);
+        assert!(stats.available);
+        assert_eq!(stats.ecpu_freq_mhz, 1902.0);
+        assert!((stats.ecpu_usage_percent - 64.0).abs() < 0.01);
+        assert!((stats.cpu_power_w - 0.89).abs() < 0.001);
+        assert_eq!(stats.thermal_status, "NOMINAL");
+    }
+}
