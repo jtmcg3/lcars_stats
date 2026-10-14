@@ -376,6 +376,16 @@ fn render_sidebar(f: &mut Frame, area: Rect, _app: &App) {
     }
 }
 
+fn line_with_stale(state: MacmonSampleState, mut spans: Vec<Span<'static>>) -> Line<'static> {
+    if state == MacmonSampleState::Stale {
+        spans.push(Span::styled(
+            "  STALE",
+            Style::default().fg(LCARS_RED).add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
 fn render_warp_nacelles(f: &mut Frame, area: Rect, app: &App) {
     let title = lcars_section_title("WARP NACELLES (CPU CLUSTERS)", LCARS_ORANGE);
 
@@ -385,7 +395,7 @@ fn render_warp_nacelles(f: &mut Frame, area: Rect, app: &App) {
     let pcpu_freq = app.apple_stats.pcpu_freq_mhz;
 
     let content = match app.apple_stats.sample_state {
-        MacmonSampleState::Live | MacmonSampleState::Stale => vec![
+        state @ (MacmonSampleState::Live | MacmonSampleState::Stale) => vec![
             Line::from(""), // Align with pill interior
             title,
             Line::from(vec![
@@ -393,7 +403,7 @@ fn render_warp_nacelles(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(format!("{:.0}%", pcpu_pct), Style::default().fg(get_usage_color(pcpu_pct))),
                 Span::styled(format!("  @ {:.0} MHz", pcpu_freq), Style::default().fg(LCARS_YELLOW)),
             ]),
-            Line::from(vec![
+            line_with_stale(state, vec![
                 Span::styled("E-CLUSTER: ", Style::default().fg(LCARS_ORANGE)),
                 Span::styled(format!("{:.0}%", ecpu_pct), Style::default().fg(get_usage_color(ecpu_pct))),
                 Span::styled(format!("  @ {:.0} MHz", ecpu_freq), Style::default().fg(LCARS_YELLOW)),
@@ -426,7 +436,7 @@ fn render_plasma_conduit(f: &mut Frame, area: Rect, app: &App) {
     let title = lcars_section_title("PLASMA CONDUIT (GPU)", LCARS_BLUE);
 
     let content = match app.apple_stats.sample_state {
-        MacmonSampleState::Live | MacmonSampleState::Stale => {
+        state @ (MacmonSampleState::Live | MacmonSampleState::Stale) => {
             let gpu_pct = app.apple_stats.gpu_usage_percent;
             let gpu_freq = app.apple_stats.gpu_freq_mhz;
             let gpu_power = app.apple_stats.gpu_power_w;
@@ -437,7 +447,7 @@ fn render_plasma_conduit(f: &mut Frame, area: Rect, app: &App) {
                     Span::styled("UTILIZATION: ", Style::default().fg(LCARS_BLUE)),
                     Span::styled(format!("{:.0}%", gpu_pct), Style::default().fg(get_usage_color(gpu_pct))),
                 ]),
-                Line::from(vec![
+                line_with_stale(state, vec![
                     Span::styled(format!("FREQ: {:.0} MHz  POWER: {:.1}W", gpu_freq, gpu_power), Style::default().fg(LCARS_YELLOW)),
                 ]),
             ]
@@ -462,13 +472,13 @@ fn render_neural_matrix(f: &mut Frame, area: Rect, app: &App) {
     let title = lcars_section_title("NEURAL MATRIX (ANE)", LCARS_PURPLE);
 
     let content = match app.apple_stats.sample_state {
-        MacmonSampleState::Live | MacmonSampleState::Stale => {
+        state @ (MacmonSampleState::Live | MacmonSampleState::Stale) => {
             let ane_power = app.apple_stats.ane_power_w;
             let status = if ane_power > 0.1 { "ACTIVE" } else { "STANDBY" };
             vec![
                 Line::from(""),
                 title,
-                Line::from(vec![
+                line_with_stale(state, vec![
                     Span::styled("POWER: ", Style::default().fg(LCARS_PURPLE)),
                     Span::styled(format!("{:.2}W", ane_power), Style::default().fg(LCARS_YELLOW)),
                     Span::styled(format!("   STATUS: {}", status), Style::default().fg(if ane_power > 0.1 { LCARS_BLUE } else { LCARS_PEACH })),
@@ -495,7 +505,7 @@ fn render_reactor_output(f: &mut Frame, area: Rect, app: &App) {
     let title = lcars_section_title("REACTOR OUTPUT (POWER)", LCARS_PEACH);
 
     let content = match app.apple_stats.sample_state {
-        MacmonSampleState::Live | MacmonSampleState::Stale => vec![
+        state @ (MacmonSampleState::Live | MacmonSampleState::Stale) => vec![
             Line::from(""),
             title,
             Line::from(vec![
@@ -504,7 +514,7 @@ fn render_reactor_output(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled("  GPU: ", Style::default().fg(LCARS_BLUE)),
                 Span::styled(format!("{:.1}W", app.apple_stats.gpu_power_w), Style::default().fg(LCARS_YELLOW)),
             ]),
-            Line::from(vec![
+            line_with_stale(state, vec![
                 Span::styled("ANE: ", Style::default().fg(LCARS_PURPLE)),
                 Span::styled(format!("{:.1}W", app.apple_stats.ane_power_w), Style::default().fg(LCARS_YELLOW)),
                 Span::styled("  TOTAL: ", Style::default().fg(LCARS_PEACH)),

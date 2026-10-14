@@ -82,7 +82,7 @@ pub struct MacmonMetrics {
 }
 
 impl MacmonMetrics {
-    /// True when the payload carries sensor signal, not serde defaults or an all-zero stub.
+    /// True only for a real sensor signal: power, cluster or GPU frequency, usage, or temperature.
     pub fn is_useful(&self) -> bool {
         self.cpu_power != 0.0
             || self.gpu_power != 0.0
@@ -97,7 +97,6 @@ impl MacmonMetrics {
             || self.gpu_usage.1 != 0.0
             || self.temp.cpu_temp_avg != 0.0
             || self.temp.gpu_temp_avg != 0.0
-            || self.memory.ram_total != 0
     }
 }
 
@@ -105,8 +104,6 @@ impl MacmonMetrics {
 #[derive(Debug, Clone, Default)]
 pub struct AppleSiliconStats {
     pub sample_state: MacmonSampleState,
-    /// Whether macmon values should be drawn (live or last-good stale sample)
-    pub available: bool,
     /// E-cluster (efficiency cores) frequency in MHz
     pub ecpu_freq_mhz: f64,
     /// E-cluster usage as percentage (0-100)
@@ -165,7 +162,6 @@ impl AppleSiliconStats {
 
         Self {
             sample_state,
-            available: true,
             ecpu_freq_mhz: metrics.ecpu_usage.0,
             ecpu_usage_percent: metrics.ecpu_usage.1 * 100.0,
             pcpu_freq_mhz: metrics.pcpu_usage.0,
@@ -186,17 +182,23 @@ impl AppleSiliconStats {
     pub fn no_data() -> Self {
         Self {
             sample_state: MacmonSampleState::NoData,
-            available: false,
             thermal_status: "NO DATA".to_string(),
             ..Default::default()
         }
+    }
+
+    /// Live and stale samples still have macmon numbers. NoData and NotInstalled do not.
+    pub fn available(&self) -> bool {
+        matches!(
+            self.sample_state,
+            MacmonSampleState::Live | MacmonSampleState::Stale
+        )
     }
 
     /// Create unavailable stats (when macmon is not installed)
     pub fn unavailable() -> Self {
         Self {
             sample_state: MacmonSampleState::NotInstalled,
-            available: false,
             thermal_status: "UNAVAILABLE".to_string(),
             ..Default::default()
         }
@@ -338,7 +340,7 @@ mod tests {
     #[test]
     fn default_metrics_are_not_available() {
         let stats = AppleSiliconStats::from_macmon(&MacmonMetrics::default());
-        assert!(!stats.available);
+        assert!(!stats.available());
         assert_eq!(stats.sample_state, MacmonSampleState::NoData);
         assert_eq!(stats.thermal_status, "NO DATA");
     }
@@ -350,14 +352,14 @@ mod tests {
         assert_eq!(metrics.cpu_power, 0.0);
         assert_eq!(metrics.ecpu_usage, (0.0, 0.0));
         let stats = AppleSiliconStats::from_macmon(&metrics);
-        assert!(!stats.available);
+        assert!(!stats.available());
         assert_eq!(stats.thermal_status, "NO DATA");
     }
 
     #[test]
     fn collector_seed_default_is_not_live() {
         let stats = AppleSiliconStats::from_macmon(&MacmonMetrics::default());
-        assert!(!stats.available);
+        assert!(!stats.available());
         assert_eq!(stats.thermal_status, "NO DATA");
     }
 
@@ -421,7 +423,7 @@ mod tests {
         let t0 = Instant::now();
         let stats = collector.stats_at(t0);
         assert_eq!(stats.sample_state, MacmonSampleState::NoData);
-        assert!(!stats.available);
+        assert!(!stats.available());
         assert_eq!(stats.thermal_status, "NO DATA");
     }
 
@@ -441,6 +443,7 @@ mod tests {
         let t0 = Instant::now();
         let live = collector.stats_at(t0);
         assert_eq!(live.sample_state, MacmonSampleState::Live);
+        assert!(live.available());
         assert_eq!(live.thermal_status, "NOMINAL");
 
         let still_live = collector.stats_at(t0 + Duration::from_secs(2));
@@ -449,6 +452,7 @@ mod tests {
 
         let stale = collector.stats_at(t0 + Duration::from_secs(2) + Duration::from_millis(1));
         assert_eq!(stale.sample_state, MacmonSampleState::Stale);
+        assert!(stale.available());
         assert_eq!(stale.thermal_status, "STALE");
         assert_eq!(stale.ecpu_freq_mhz, 1902.0);
         assert!((stale.ecpu_usage_percent - 64.0).abs() < 0.01);
