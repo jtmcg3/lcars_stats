@@ -14,6 +14,17 @@ use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
+
+/// How a macmon sample should be shown. Collector process up is not the same as a useful sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MacmonSampleState {
+    #[default]
+    NoData,
+    NotInstalled,
+    Live,
+    Stale,
+}
 
 /// Temperature readings from Apple Silicon sensors
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -70,10 +81,31 @@ pub struct MacmonMetrics {
     pub sys_power: f64,
 }
 
+impl MacmonMetrics {
+    /// True when the payload carries sensor signal, not serde defaults or an all-zero stub.
+    pub fn is_useful(&self) -> bool {
+        self.cpu_power != 0.0
+            || self.gpu_power != 0.0
+            || self.ane_power != 0.0
+            || self.all_power != 0.0
+            || self.sys_power != 0.0
+            || self.ecpu_usage.0 != 0.0
+            || self.ecpu_usage.1 != 0.0
+            || self.pcpu_usage.0 != 0.0
+            || self.pcpu_usage.1 != 0.0
+            || self.gpu_usage.0 != 0.0
+            || self.gpu_usage.1 != 0.0
+            || self.temp.cpu_temp_avg != 0.0
+            || self.temp.gpu_temp_avg != 0.0
+            || self.memory.ram_total != 0
+    }
+}
+
 /// Processed Apple Silicon metrics for display
 #[derive(Debug, Clone, Default)]
 pub struct AppleSiliconStats {
-    /// Whether macmon is available
+    pub sample_state: MacmonSampleState,
+    /// Whether macmon values should be drawn (live or last-good stale sample)
     pub available: bool,
     /// E-cluster (efficiency cores) frequency in MHz
     pub ecpu_freq_mhz: f64,
@@ -108,12 +140,20 @@ pub struct AppleSiliconStats {
 impl AppleSiliconStats {
     /// Create stats from macmon metrics
     pub fn from_macmon(metrics: &MacmonMetrics) -> Self {
+        if !metrics.is_useful() {
+            return Self::no_data();
+        }
+        Self::from_useful(metrics, MacmonSampleState::Live)
+    }
+
+    fn from_useful(metrics: &MacmonMetrics, sample_state: MacmonSampleState) -> Self {
         let cpu_temp = metrics.temp.cpu_temp_avg;
         let gpu_temp = metrics.temp.gpu_temp_avg;
 
-        // Determine thermal status
         let max_temp = cpu_temp.max(gpu_temp);
-        let thermal_status = if max_temp > 95.0 {
+        let thermal_status = if sample_state == MacmonSampleState::Stale {
+            "STALE".to_string()
+        } else if max_temp > 95.0 {
             "CRITICAL".to_string()
         } else if max_temp > 85.0 {
             "THROTTLING".to_string()
@@ -124,6 +164,7 @@ impl AppleSiliconStats {
         };
 
         Self {
+            sample_state,
             available: true,
             ecpu_freq_mhz: metrics.ecpu_usage.0,
             ecpu_usage_percent: metrics.ecpu_usage.1 * 100.0,
@@ -142,9 +183,19 @@ impl AppleSiliconStats {
         }
     }
 
+    pub fn no_data() -> Self {
+        Self {
+            sample_state: MacmonSampleState::NoData,
+            available: false,
+            thermal_status: "NO DATA".to_string(),
+            ..Default::default()
+        }
+    }
+
     /// Create unavailable stats (when macmon is not installed)
     pub fn unavailable() -> Self {
         Self {
+            sample_state: MacmonSampleState::NotInstalled,
             available: false,
             thermal_status: "UNAVAILABLE".to_string(),
             ..Default::default()
@@ -156,10 +207,14 @@ impl AppleSiliconStats {
 pub struct MacmonCollector {
     receiver: Receiver<MacmonMetrics>,
     _child: Option<Child>,
-    latest: MacmonMetrics,
+    latest_useful: Option<MacmonMetrics>,
+    last_useful_at: Option<Instant>,
+    stale_after: Duration,
 }
 
 impl MacmonCollector {
+    const STALE_AFTER: Duration = Duration::from_secs(2);
+
     /// Start a new macmon collector
     ///
     /// Returns None if macmon is not installed
@@ -200,17 +255,36 @@ impl MacmonCollector {
         Some(Self {
             receiver: rx,
             _child: Some(child),
-            latest: MacmonMetrics::default(),
+            latest_useful: None,
+            last_useful_at: None,
+            stale_after: Self::STALE_AFTER,
         })
     }
 
-    /// Get the latest metrics, updating from the collector
-    pub fn get_latest(&mut self) -> &MacmonMetrics {
-        // Drain all pending messages, keep the latest
+    /// Drain pending lines and map them to display stats at `now`.
+    pub fn stats_at(&mut self, now: Instant) -> AppleSiliconStats {
         while let Ok(metrics) = self.receiver.try_recv() {
-            self.latest = metrics;
+            if metrics.is_useful() {
+                self.latest_useful = Some(metrics);
+                self.last_useful_at = Some(now);
+            }
         }
-        &self.latest
+
+        match (&self.latest_useful, self.last_useful_at) {
+            (Some(metrics), Some(seen)) => {
+                let age = now.saturating_duration_since(seen);
+                if age > self.stale_after {
+                    AppleSiliconStats::from_useful(metrics, MacmonSampleState::Stale)
+                } else {
+                    AppleSiliconStats::from_useful(metrics, MacmonSampleState::Live)
+                }
+            }
+            _ => AppleSiliconStats::no_data(),
+        }
+    }
+
+    pub fn stats(&mut self) -> AppleSiliconStats {
+        self.stats_at(Instant::now())
     }
 }
 
@@ -239,10 +313,33 @@ mod tests {
         "sys_power": 16.4
     }"#;
 
+    const NESTED_SCHEMA_JSON: &str = r#"{
+        "gpu_usage": {"GPUPH": {"units": 20, "freq_mhz": 338, "usage": 0.29}},
+        "power": {"cpu": 0.73, "gpu": 0.37, "ane": 0.1},
+        "temp": {"cpu_avg": 52.6, "gpu_avg": 49.5}
+    }"#;
+
+    fn classic_metrics() -> MacmonMetrics {
+        serde_json::from_str(CLASSIC_PIPE_JSON).expect("classic macmon JSON")
+    }
+
+    fn test_collector(stale_after: Duration) -> (MacmonCollector, Sender<MacmonMetrics>) {
+        let (tx, rx) = mpsc::channel();
+        let collector = MacmonCollector {
+            receiver: rx,
+            _child: None,
+            latest_useful: None,
+            last_useful_at: None,
+            stale_after,
+        };
+        (collector, tx)
+    }
+
     #[test]
     fn default_metrics_are_not_available() {
         let stats = AppleSiliconStats::from_macmon(&MacmonMetrics::default());
         assert!(!stats.available);
+        assert_eq!(stats.sample_state, MacmonSampleState::NoData);
         assert_eq!(stats.thermal_status, "NO DATA");
     }
 
@@ -266,13 +363,54 @@ mod tests {
 
     #[test]
     fn classic_pipe_json_is_live_with_sample_values() {
-        let metrics: MacmonMetrics =
-            serde_json::from_str(CLASSIC_PIPE_JSON).expect("classic macmon JSON");
-        let stats = AppleSiliconStats::from_macmon(&metrics);
+        let stats = AppleSiliconStats::from_macmon(&classic_metrics());
         assert!(stats.available);
+        assert_eq!(stats.sample_state, MacmonSampleState::Live);
         assert_eq!(stats.ecpu_freq_mhz, 1902.0);
         assert!((stats.ecpu_usage_percent - 64.0).abs() < 0.01);
         assert!((stats.cpu_power_w - 0.89).abs() < 0.001);
         assert_eq!(stats.thermal_status, "NOMINAL");
+    }
+
+    #[test]
+    fn nested_schema_does_not_deserialize_as_a_live_sample() {
+        let parsed = serde_json::from_str::<MacmonMetrics>(NESTED_SCHEMA_JSON);
+        assert!(parsed.is_err(), "nested gpu_usage object must not coerce into a tuple");
+    }
+
+    #[test]
+    fn hung_collector_stays_no_data() {
+        let (mut collector, _tx) = test_collector(Duration::from_secs(2));
+        let t0 = Instant::now();
+        let stats = collector.stats_at(t0);
+        assert_eq!(stats.sample_state, MacmonSampleState::NoData);
+        assert!(!stats.available);
+        assert_eq!(stats.thermal_status, "NO DATA");
+    }
+
+    #[test]
+    fn zero_payload_does_not_become_live() {
+        let (mut collector, tx) = test_collector(Duration::from_secs(2));
+        tx.send(MacmonMetrics::default()).unwrap();
+        let stats = collector.stats_at(Instant::now());
+        assert_eq!(stats.sample_state, MacmonSampleState::NoData);
+        assert_eq!(stats.thermal_status, "NO DATA");
+    }
+
+    #[test]
+    fn useful_sample_then_silence_becomes_stale() {
+        let (mut collector, tx) = test_collector(Duration::from_secs(2));
+        tx.send(classic_metrics()).unwrap();
+        let t0 = Instant::now();
+        let live = collector.stats_at(t0);
+        assert_eq!(live.sample_state, MacmonSampleState::Live);
+        assert!(live.available);
+        assert_eq!(live.thermal_status, "NOMINAL");
+
+        let stale = collector.stats_at(t0 + Duration::from_secs(3));
+        assert_eq!(stale.sample_state, MacmonSampleState::Stale);
+        assert!(stale.available);
+        assert_eq!(stale.thermal_status, "STALE");
+        assert_eq!(stale.ecpu_freq_mhz, 1902.0);
     }
 }

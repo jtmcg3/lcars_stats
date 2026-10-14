@@ -1,7 +1,7 @@
 mod apple_silicon;
 mod lcars_widgets;
 
-use apple_silicon::{AppleSiliconStats, MacmonCollector};
+use apple_silicon::{AppleSiliconStats, MacmonCollector, MacmonSampleState};
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -68,7 +68,7 @@ impl App {
         // Try to start macmon collector
         let macmon = MacmonCollector::new();
         let apple_stats = if macmon.is_some() {
-            AppleSiliconStats::default()
+            AppleSiliconStats::no_data()
         } else {
             AppleSiliconStats::unavailable()
         };
@@ -142,10 +142,8 @@ impl App {
             self.disk_stats.write_speed = (total_write.saturating_sub(old_write)) as f64;
         }
 
-        // Update Apple Silicon stats from macmon
         if let Some(ref mut collector) = self.macmon {
-            let metrics = collector.get_latest();
-            self.apple_stats = AppleSiliconStats::from_macmon(metrics);
+            self.apple_stats = collector.stats();
         }
 
         // Update top processes
@@ -386,8 +384,8 @@ fn render_warp_nacelles(f: &mut Frame, area: Rect, app: &App) {
     let ecpu_freq = app.apple_stats.ecpu_freq_mhz;
     let pcpu_freq = app.apple_stats.pcpu_freq_mhz;
 
-    let content = if app.apple_stats.available {
-        vec![
+    let content = match app.apple_stats.sample_state {
+        MacmonSampleState::Live | MacmonSampleState::Stale => vec![
             Line::from(""), // Align with pill interior
             title,
             Line::from(vec![
@@ -400,19 +398,24 @@ fn render_warp_nacelles(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(format!("{:.0}%", ecpu_pct), Style::default().fg(get_usage_color(ecpu_pct))),
                 Span::styled(format!("  @ {:.0} MHz", ecpu_freq), Style::default().fg(LCARS_YELLOW)),
             ]),
-        ]
-    } else {
-        // Fallback to aggregate CPU from sysinfo
-        let cpu_usage: f32 = app.sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / app.sys.cpus().len() as f32;
-        vec![
-            Line::from(""), // Align with pill interior
+        ],
+        MacmonSampleState::NoData => vec![
+            Line::from(""),
             title,
-            Line::from(vec![
-                Span::styled("AGGREGATE: ", Style::default().fg(LCARS_ORANGE)),
-                Span::styled(format!("{:.0}%", cpu_usage), Style::default().fg(get_usage_color(cpu_usage as f64))),
-                Span::styled(" (macmon unavailable)", Style::default().fg(LCARS_PEACH)),
-            ]),
-        ]
+            Line::from(Span::styled("NO DATA", Style::default().fg(LCARS_PEACH))),
+        ],
+        MacmonSampleState::NotInstalled => {
+            let cpu_usage: f32 = app.sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / app.sys.cpus().len() as f32;
+            vec![
+                Line::from(""),
+                title,
+                Line::from(vec![
+                    Span::styled("AGGREGATE: ", Style::default().fg(LCARS_ORANGE)),
+                    Span::styled(format!("{:.0}%", cpu_usage), Style::default().fg(get_usage_color(cpu_usage as f64))),
+                    Span::styled(" (macmon unavailable)", Style::default().fg(LCARS_PEACH)),
+                ]),
+            ]
+        }
     };
 
     let para = Paragraph::new(content).style(Style::default().bg(LCARS_BG));
@@ -422,28 +425,33 @@ fn render_warp_nacelles(f: &mut Frame, area: Rect, app: &App) {
 fn render_plasma_conduit(f: &mut Frame, area: Rect, app: &App) {
     let title = lcars_section_title("PLASMA CONDUIT (GPU)", LCARS_BLUE);
 
-    let content = if app.apple_stats.available {
-        let gpu_pct = app.apple_stats.gpu_usage_percent;
-        let gpu_freq = app.apple_stats.gpu_freq_mhz;
-        let gpu_power = app.apple_stats.gpu_power_w;
-
-        vec![
-            Line::from(""), // Align with pill interior
+    let content = match app.apple_stats.sample_state {
+        MacmonSampleState::Live | MacmonSampleState::Stale => {
+            let gpu_pct = app.apple_stats.gpu_usage_percent;
+            let gpu_freq = app.apple_stats.gpu_freq_mhz;
+            let gpu_power = app.apple_stats.gpu_power_w;
+            vec![
+                Line::from(""),
+                title,
+                Line::from(vec![
+                    Span::styled("UTILIZATION: ", Style::default().fg(LCARS_BLUE)),
+                    Span::styled(format!("{:.0}%", gpu_pct), Style::default().fg(get_usage_color(gpu_pct))),
+                ]),
+                Line::from(vec![
+                    Span::styled(format!("FREQ: {:.0} MHz  POWER: {:.1}W", gpu_freq, gpu_power), Style::default().fg(LCARS_YELLOW)),
+                ]),
+            ]
+        }
+        MacmonSampleState::NoData => vec![
+            Line::from(""),
             title,
-            Line::from(vec![
-                Span::styled("UTILIZATION: ", Style::default().fg(LCARS_BLUE)),
-                Span::styled(format!("{:.0}%", gpu_pct), Style::default().fg(get_usage_color(gpu_pct))),
-            ]),
-            Line::from(vec![
-                Span::styled(format!("FREQ: {:.0} MHz  POWER: {:.1}W", gpu_freq, gpu_power), Style::default().fg(LCARS_YELLOW)),
-            ]),
-        ]
-    } else {
-        vec![
-            Line::from(""), // Align with pill interior
+            Line::from(Span::styled("NO DATA", Style::default().fg(LCARS_PEACH))),
+        ],
+        MacmonSampleState::NotInstalled => vec![
+            Line::from(""),
             title,
             Line::from(Span::styled("GPU metrics require macmon", Style::default().fg(LCARS_PEACH))),
-        ]
+        ],
     };
 
     let para = Paragraph::new(content).style(Style::default().bg(LCARS_BG));
@@ -453,24 +461,30 @@ fn render_plasma_conduit(f: &mut Frame, area: Rect, app: &App) {
 fn render_neural_matrix(f: &mut Frame, area: Rect, app: &App) {
     let title = lcars_section_title("NEURAL MATRIX (ANE)", LCARS_PURPLE);
 
-    let content = if app.apple_stats.available {
-        let ane_power = app.apple_stats.ane_power_w;
-        let status = if ane_power > 0.1 { "ACTIVE" } else { "STANDBY" };
-        vec![
-            Line::from(""), // Align with pill interior
+    let content = match app.apple_stats.sample_state {
+        MacmonSampleState::Live | MacmonSampleState::Stale => {
+            let ane_power = app.apple_stats.ane_power_w;
+            let status = if ane_power > 0.1 { "ACTIVE" } else { "STANDBY" };
+            vec![
+                Line::from(""),
+                title,
+                Line::from(vec![
+                    Span::styled("POWER: ", Style::default().fg(LCARS_PURPLE)),
+                    Span::styled(format!("{:.2}W", ane_power), Style::default().fg(LCARS_YELLOW)),
+                    Span::styled(format!("   STATUS: {}", status), Style::default().fg(if ane_power > 0.1 { LCARS_BLUE } else { LCARS_PEACH })),
+                ]),
+            ]
+        }
+        MacmonSampleState::NoData => vec![
+            Line::from(""),
             title,
-            Line::from(vec![
-                Span::styled("POWER: ", Style::default().fg(LCARS_PURPLE)),
-                Span::styled(format!("{:.2}W", ane_power), Style::default().fg(LCARS_YELLOW)),
-                Span::styled(format!("   STATUS: {}", status), Style::default().fg(if ane_power > 0.1 { LCARS_BLUE } else { LCARS_PEACH })),
-            ]),
-        ]
-    } else {
-        vec![
-            Line::from(""), // Align with pill interior
+            Line::from(Span::styled("NO DATA", Style::default().fg(LCARS_PEACH))),
+        ],
+        MacmonSampleState::NotInstalled => vec![
+            Line::from(""),
             title,
             Line::from(Span::styled("ANE metrics require macmon", Style::default().fg(LCARS_PEACH))),
-        ]
+        ],
     };
 
     let para = Paragraph::new(content).style(Style::default().bg(LCARS_BG));
@@ -480,9 +494,9 @@ fn render_neural_matrix(f: &mut Frame, area: Rect, app: &App) {
 fn render_reactor_output(f: &mut Frame, area: Rect, app: &App) {
     let title = lcars_section_title("REACTOR OUTPUT (POWER)", LCARS_PEACH);
 
-    let content = if app.apple_stats.available {
-        vec![
-            Line::from(""), // Align with pill interior
+    let content = match app.apple_stats.sample_state {
+        MacmonSampleState::Live | MacmonSampleState::Stale => vec![
+            Line::from(""),
             title,
             Line::from(vec![
                 Span::styled("CPU: ", Style::default().fg(LCARS_ORANGE)),
@@ -496,13 +510,17 @@ fn render_reactor_output(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled("  TOTAL: ", Style::default().fg(LCARS_PEACH)),
                 Span::styled(format!("{:.1}W", app.apple_stats.sys_power_w), Style::default().fg(LCARS_YELLOW).add_modifier(Modifier::BOLD)),
             ]),
-        ]
-    } else {
-        vec![
-            Line::from(""), // Align with pill interior
+        ],
+        MacmonSampleState::NoData => vec![
+            Line::from(""),
+            title,
+            Line::from(Span::styled("NO DATA", Style::default().fg(LCARS_PEACH))),
+        ],
+        MacmonSampleState::NotInstalled => vec![
+            Line::from(""),
             title,
             Line::from(Span::styled("Power metrics require macmon", Style::default().fg(LCARS_PEACH))),
-        ]
+        ],
     };
 
     let para = Paragraph::new(content).style(Style::default().bg(LCARS_BG));
@@ -512,31 +530,39 @@ fn render_reactor_output(f: &mut Frame, area: Rect, app: &App) {
 fn render_environmental(f: &mut Frame, area: Rect, app: &App) {
     let title = lcars_section_title("ENVIRONMENTAL CONTROLS (THERMAL)", LCARS_YELLOW);
 
-    let content = if app.apple_stats.available {
-        let cpu_temp = app.apple_stats.cpu_temp_c;
-        let gpu_temp = app.apple_stats.gpu_temp_c;
-        vec![
-            Line::from(""), // Align with pill interior
+    let content = match app.apple_stats.sample_state {
+        MacmonSampleState::Live | MacmonSampleState::Stale => {
+            let cpu_temp = app.apple_stats.cpu_temp_c;
+            let gpu_temp = app.apple_stats.gpu_temp_c;
+            let status_color = match app.apple_stats.thermal_status.as_str() {
+                "NOMINAL" => LCARS_BLUE,
+                "ELEVATED" => LCARS_YELLOW,
+                "STALE" => LCARS_PEACH,
+                _ => LCARS_RED,
+            };
+            vec![
+                Line::from(""),
+                title,
+                Line::from(vec![
+                    Span::styled("CPU: ", Style::default().fg(LCARS_ORANGE)),
+                    Span::styled(format!("{:.0}°C", cpu_temp), Style::default().fg(get_temp_color(cpu_temp))),
+                    Span::styled("  GPU: ", Style::default().fg(LCARS_BLUE)),
+                    Span::styled(format!("{:.0}°C", gpu_temp), Style::default().fg(get_temp_color(gpu_temp))),
+                    Span::styled("  STATUS: ", Style::default().fg(LCARS_PEACH)),
+                    Span::styled(&app.apple_stats.thermal_status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                ]),
+            ]
+        }
+        MacmonSampleState::NoData => vec![
+            Line::from(""),
             title,
-            Line::from(vec![
-                Span::styled("CPU: ", Style::default().fg(LCARS_ORANGE)),
-                Span::styled(format!("{:.0}°C", cpu_temp), Style::default().fg(get_temp_color(cpu_temp))),
-                Span::styled("  GPU: ", Style::default().fg(LCARS_BLUE)),
-                Span::styled(format!("{:.0}°C", gpu_temp), Style::default().fg(get_temp_color(gpu_temp))),
-                Span::styled("  STATUS: ", Style::default().fg(LCARS_PEACH)),
-                Span::styled(&app.apple_stats.thermal_status, Style::default().fg(
-                    if app.apple_stats.thermal_status == "NOMINAL" { LCARS_BLUE }
-                    else if app.apple_stats.thermal_status == "ELEVATED" { LCARS_YELLOW }
-                    else { LCARS_RED }
-                ).add_modifier(Modifier::BOLD)),
-            ]),
-        ]
-    } else {
-        vec![
-            Line::from(""), // Align with pill interior
+            Line::from(Span::styled("NO DATA", Style::default().fg(LCARS_PEACH))),
+        ],
+        MacmonSampleState::NotInstalled => vec![
+            Line::from(""),
             title,
             Line::from(Span::styled("Temperature metrics require macmon", Style::default().fg(LCARS_PEACH))),
-        ]
+        ],
     };
 
     let para = Paragraph::new(content).style(Style::default().bg(LCARS_BG));
