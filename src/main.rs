@@ -665,3 +665,146 @@ fn render_sensor_array(f: &mut Frame, area: Rect, app: &App) {
     let para = Paragraph::new(lines).style(Style::default().bg(LCARS_BG));
     f.render_widget(para, area);
 }
+
+#[cfg(test)]
+mod panel_state {
+    use super::apple_silicon::{AppleSiliconStats, MacmonMetrics, MacmonSampleState, TempMetrics};
+    use super::{
+        render_environmental, render_neural_matrix, render_plasma_conduit, render_reactor_output,
+        render_warp_nacelles, App,
+    };
+    use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Frame, Terminal};
+
+    fn reading() -> AppleSiliconStats {
+        AppleSiliconStats::from_macmon(&MacmonMetrics {
+            ecpu_usage: (1200.0, 0.25),
+            pcpu_usage: (3200.0, 0.5),
+            gpu_usage: (800.0, 0.125),
+            cpu_power: 3.5,
+            gpu_power: 1.5,
+            ane_power: 0.25,
+            all_power: 6.0,
+            sys_power: 8.0,
+            temp: TempMetrics {
+                cpu_temp_avg: 45.0,
+                gpu_temp_avg: 40.0,
+            },
+            ..Default::default()
+        })
+    }
+
+    fn mark_stale(mut stats: AppleSiliconStats) -> AppleSiliconStats {
+        stats.sample_state = MacmonSampleState::Stale;
+        stats.thermal_status = "STALE".to_string();
+        stats
+    }
+
+    fn paint(app: &App, render: fn(&mut Frame, Rect, &App)) -> String {
+        let backend = TestBackend::new(100, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), app))
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    fn buffer_text(buf: &Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn no_data_panels_do_not_fall_back_to_sysinfo_or_zeros() {
+        let mut app = App::new();
+        app.apple_stats = AppleSiliconStats::no_data();
+        let cpu = paint(&app, render_warp_nacelles);
+        assert!(cpu.contains("NO DATA"), "{cpu}");
+        assert!(!cpu.contains("AGGREGATE"), "{cpu}");
+        assert!(!cpu.contains("macmon unavailable"), "{cpu}");
+        assert!(!cpu.contains("P-CLUSTER"), "{cpu}");
+
+        let gpu = paint(&app, render_plasma_conduit);
+        assert!(gpu.contains("NO DATA"), "{gpu}");
+        assert!(!gpu.contains("require macmon"), "{gpu}");
+
+        let thermal = paint(&app, render_environmental);
+        assert!(thermal.contains("NO DATA"), "{thermal}");
+        assert!(!thermal.contains("NOMINAL"), "{thermal}");
+        assert!(!thermal.contains("require macmon"), "{thermal}");
+    }
+
+    #[test]
+    fn not_installed_panels_keep_the_existing_fallback() {
+        let mut app = App::new();
+        app.apple_stats = AppleSiliconStats::unavailable();
+        let cpu = paint(&app, render_warp_nacelles);
+        assert!(cpu.contains("AGGREGATE"), "{cpu}");
+        assert!(cpu.contains("macmon unavailable"), "{cpu}");
+        assert!(!cpu.contains("NO DATA"), "{cpu}");
+
+        let gpu = paint(&app, render_plasma_conduit);
+        assert!(gpu.contains("GPU metrics require macmon"), "{gpu}");
+        let ane = paint(&app, render_neural_matrix);
+        assert!(ane.contains("ANE metrics require macmon"), "{ane}");
+        let power = paint(&app, render_reactor_output);
+        assert!(power.contains("Power metrics require macmon"), "{power}");
+        let thermal = paint(&app, render_environmental);
+        assert!(thermal.contains("Temperature metrics require macmon"), "{thermal}");
+    }
+
+    #[test]
+    fn live_panels_show_readings_without_a_stale_mark() {
+        let mut app = App::new();
+        app.apple_stats = reading();
+        let cpu = paint(&app, render_warp_nacelles);
+        assert!(cpu.contains("3200"), "{cpu}");
+        assert!(cpu.contains("50%"), "{cpu}");
+        assert!(cpu.contains("1200"), "{cpu}");
+        assert!(!cpu.contains("STALE"), "{cpu}");
+        assert!(!cpu.contains("NO DATA"), "{cpu}");
+
+        let gpu = paint(&app, render_plasma_conduit);
+        assert!(gpu.contains("800"), "{gpu}");
+        assert!(gpu.contains("1.5W"), "{gpu}");
+        assert!(!gpu.contains("STALE"), "{gpu}");
+    }
+
+    #[test]
+    fn stale_panels_keep_last_numbers_and_show_stale() {
+        let mut app = App::new();
+        app.apple_stats = mark_stale(reading());
+        let cpu = paint(&app, render_warp_nacelles);
+        assert!(cpu.contains("3200"), "{cpu}");
+        assert!(cpu.contains("50%"), "{cpu}");
+        assert!(cpu.contains("1200"), "{cpu}");
+        assert!(cpu.contains("STALE"), "{cpu}");
+        assert!(!cpu.contains("NO DATA"), "{cpu}");
+        assert!(!cpu.contains("AGGREGATE"), "{cpu}");
+
+        let gpu = paint(&app, render_plasma_conduit);
+        assert!(gpu.contains("800"), "{gpu}");
+        assert!(gpu.contains("1.5W"), "{gpu}");
+        assert!(gpu.contains("STALE"), "{gpu}");
+
+        let ane = paint(&app, render_neural_matrix);
+        assert!(ane.contains("0.25W"), "{ane}");
+        assert!(ane.contains("STALE"), "{ane}");
+
+        let power = paint(&app, render_reactor_output);
+        assert!(power.contains("3.5W"), "{power}");
+        assert!(power.contains("8.0W"), "{power}");
+        assert!(power.contains("STALE"), "{power}");
+
+        let thermal = paint(&app, render_environmental);
+        assert!(thermal.contains("45"), "{thermal}");
+        assert!(thermal.contains("40"), "{thermal}");
+        assert!(thermal.contains("STALE"), "{thermal}");
+        assert!(!thermal.contains("NOMINAL"), "{thermal}");
+    }
+}

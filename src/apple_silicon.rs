@@ -364,18 +364,55 @@ mod tests {
     #[test]
     fn classic_pipe_json_is_live_with_sample_values() {
         let stats = AppleSiliconStats::from_macmon(&classic_metrics());
-        assert!(stats.available);
         assert_eq!(stats.sample_state, MacmonSampleState::Live);
         assert_eq!(stats.ecpu_freq_mhz, 1902.0);
         assert!((stats.ecpu_usage_percent - 64.0).abs() < 0.01);
+        assert_eq!(stats.pcpu_freq_mhz, 2044.0);
+        assert!((stats.pcpu_usage_percent - 2.0).abs() < 0.01);
+        assert_eq!(stats.gpu_freq_mhz, 338.0);
+        assert!((stats.gpu_usage_percent - 6.0).abs() < 0.01);
         assert!((stats.cpu_power_w - 0.89).abs() < 0.001);
+        assert!((stats.gpu_power_w - 0.29).abs() < 0.001);
+        assert!((stats.sys_power_w - 16.4).abs() < 0.001);
+        assert!((stats.cpu_temp_c - 48.9).abs() < 0.01);
+        assert!((stats.gpu_temp_c - 44.0).abs() < 0.01);
         assert_eq!(stats.thermal_status, "NOMINAL");
     }
 
     #[test]
-    fn nested_schema_does_not_deserialize_as_a_live_sample() {
-        let parsed = serde_json::from_str::<MacmonMetrics>(NESTED_SCHEMA_JSON);
-        assert!(parsed.is_err(), "nested gpu_usage object must not coerce into a tuple");
+    fn nested_schema_json_is_no_data_not_nominal() {
+        let (mut collector, tx) = test_collector(Duration::from_secs(2));
+        if let Ok(metrics) = serde_json::from_str::<MacmonMetrics>(NESTED_SCHEMA_JSON) {
+            tx.send(metrics).unwrap();
+        }
+        let stats = collector.stats_at(Instant::now());
+        assert_eq!(stats.sample_state, MacmonSampleState::NoData);
+        assert_eq!(stats.thermal_status, "NO DATA");
+
+        let mismatched: MacmonMetrics = serde_json::from_str(
+            r#"{"cpu":{"ecpu_usage":[1902,0.64],"power":4.2},"gpu":{"freq_mhz":900,"usage":0.4},"temp":{"cpu_avg":88.0}}"#,
+        )
+        .unwrap();
+        let stats = AppleSiliconStats::from_macmon(&mismatched);
+        assert_eq!(stats.sample_state, MacmonSampleState::NoData);
+        assert_eq!(stats.thermal_status, "NO DATA");
+        assert_eq!(stats.cpu_power_w, 0.0);
+        assert_eq!(stats.ecpu_freq_mhz, 0.0);
+        assert_eq!(stats.cpu_temp_c, 0.0);
+    }
+
+    #[test]
+    fn memory_only_json_is_no_data_not_nominal() {
+        let metrics: MacmonMetrics = serde_json::from_str(
+            r#"{"memory":{"ram_total":17179869184,"ram_usage":8589934592,"swap_total":1,"swap_usage":1}}"#,
+        )
+        .unwrap();
+        assert!(metrics.memory.ram_total > 0);
+        let stats = AppleSiliconStats::from_macmon(&metrics);
+        assert_eq!(stats.sample_state, MacmonSampleState::NoData);
+        assert_eq!(stats.thermal_status, "NO DATA");
+        assert_eq!(stats.cpu_power_w, 0.0);
+        assert_eq!(stats.cpu_temp_c, 0.0);
     }
 
     #[test]
@@ -404,13 +441,37 @@ mod tests {
         let t0 = Instant::now();
         let live = collector.stats_at(t0);
         assert_eq!(live.sample_state, MacmonSampleState::Live);
-        assert!(live.available);
         assert_eq!(live.thermal_status, "NOMINAL");
 
-        let stale = collector.stats_at(t0 + Duration::from_secs(3));
+        let still_live = collector.stats_at(t0 + Duration::from_secs(2));
+        assert_eq!(still_live.sample_state, MacmonSampleState::Live);
+        assert_eq!(still_live.thermal_status, "NOMINAL");
+
+        let stale = collector.stats_at(t0 + Duration::from_secs(2) + Duration::from_millis(1));
         assert_eq!(stale.sample_state, MacmonSampleState::Stale);
-        assert!(stale.available);
         assert_eq!(stale.thermal_status, "STALE");
         assert_eq!(stale.ecpu_freq_mhz, 1902.0);
+        assert!((stale.ecpu_usage_percent - 64.0).abs() < 0.01);
+        assert!((stale.cpu_power_w - 0.89).abs() < 0.001);
+        assert!((stale.sys_power_w - 16.4).abs() < 0.001);
+        assert!((stale.cpu_temp_c - 48.9).abs() < 0.01);
+        assert!((stale.gpu_temp_c - 44.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn empty_sample_does_not_refresh_a_stale_reading() {
+        let (mut collector, tx) = test_collector(Duration::from_secs(2));
+        tx.send(classic_metrics()).unwrap();
+        let t0 = Instant::now();
+        assert_eq!(
+            collector.stats_at(t0).sample_state,
+            MacmonSampleState::Live
+        );
+        tx.send(MacmonMetrics::default()).unwrap();
+        let stale = collector.stats_at(t0 + Duration::from_secs(3));
+        assert_eq!(stale.sample_state, MacmonSampleState::Stale);
+        assert_eq!(stale.thermal_status, "STALE");
+        assert_eq!(stale.ecpu_freq_mhz, 1902.0);
+        assert!((stale.cpu_power_w - 0.89).abs() < 0.001);
     }
 }
