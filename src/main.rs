@@ -326,14 +326,15 @@ impl LcarsFooter {
 
 impl Widget for LcarsFooter {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let items: Vec<(&str, ratatui::style::Color)> = self.items
+        let labels: Vec<String> = self
+            .items
             .iter()
-            .map(|(k, v, c)| {
-                let combined = format!("{} {}", k, v);
-                // We need to leak this string to get a static lifetime
-                // This is a hack but works for our use case
-                (Box::leak(combined.into_boxed_str()) as &str, *c)
-            })
+            .map(|(k, v, _)| format!("{k} {v}"))
+            .collect();
+        let items: Vec<(&str, ratatui::style::Color)> = labels
+            .iter()
+            .zip(self.items.iter())
+            .map(|(label, (_, _, color))| (label.as_str(), *color))
             .collect();
         draw_lcars_footer(buf, area, &items, &self.status);
     }

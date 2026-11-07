@@ -212,7 +212,7 @@ impl Widget for LcarsGauge {
 
 /// Draw LCARS-style header bar
 pub fn draw_lcars_header(buf: &mut Buffer, area: Rect, title: &str, stardate: &str) {
-    if area.height < 1 {
+    if area.height < 1 || area.width < 2 {
         return;
     }
 
@@ -291,7 +291,7 @@ pub fn draw_lcars_header(buf: &mut Buffer, area: Rect, title: &str, stardate: &s
 
 /// Draw LCARS-style footer bar
 pub fn draw_lcars_footer(buf: &mut Buffer, area: Rect, items: &[(&str, Color)], status: &str) {
-    if area.height < 1 {
+    if area.height < 1 || area.width < 2 {
         return;
     }
 
@@ -325,8 +325,12 @@ pub fn draw_lcars_footer(buf: &mut Buffer, area: Rect, items: &[(&str, Color)], 
     }
 
     // Status on the right
-    let status_text = format!("STATUS: {}", status);
-    let status_x = area.x + area.width - status_text.len() as u16 - 5;
+    let status_text = format!("STATUS: {status}");
+    let status_x = area
+        .x
+        .saturating_add(area.width)
+        .saturating_sub(status_text.len() as u16)
+        .saturating_sub(5);
     if status_x > x_pos {
         // Status pill
         for i in 0..3 {
