@@ -1,7 +1,10 @@
 mod apple_silicon;
+mod asahi;
 mod lcars_widgets;
+mod palette;
 
-use apple_silicon::{AppleSiliconStats, MacmonCollector};
+use apple_silicon::{AppleSiliconStats, MacmonCollector, Source};
+use asahi::AsahiCollector;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -18,7 +21,8 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
 
 /// Network statistics tracking
@@ -54,8 +58,13 @@ struct App {
     network_stats: NetworkStats,
     disk_stats: DiskStats,
     macmon: Option<MacmonCollector>,
+    /// Linux (Asahi) sysfs collector, used when macmon is absent.
+    asahi: Option<AsahiCollector>,
     apple_stats: AppleSiliconStats,
     top_processes: Vec<ProcessInfo>,
+    /// Desktop theme being followed for colours, and its last-seen change time.
+    theme_dir: Option<PathBuf>,
+    theme_stamp: Option<SystemTime>,
 }
 
 impl App {
@@ -65,10 +74,17 @@ impl App {
         let networks = Networks::new_with_refreshed_list();
         let disks = Disks::new_with_refreshed_list();
 
-        // Try to start macmon collector
+        set_palette(palette::load());
+        let theme_dir = palette::current_theme_dir();
+        let theme_stamp = theme_dir.as_deref().and_then(palette::theme_stamp);
+
+        // Prefer macmon (macOS); fall back to Asahi sysfs on Linux.
         let macmon = MacmonCollector::new();
+        let asahi = if macmon.is_none() { AsahiCollector::detect() } else { None };
         let apple_stats = if macmon.is_some() {
             AppleSiliconStats::default()
+        } else if let Some(ref collector) = asahi {
+            collector.sample(&[])
         } else {
             AppleSiliconStats::unavailable()
         };
@@ -91,8 +107,22 @@ impl App {
                 write_speed: 0.0,
             },
             macmon,
+            asahi,
             apple_stats,
             top_processes: Vec::new(),
+            theme_dir,
+            theme_stamp,
+        }
+    }
+
+    /// Re-read the palette when the desktop theme changes (Omarchy rewrites colors.toml).
+    fn follow_theme(&mut self) {
+        let Some(dir) = palette::current_theme_dir() else { return };
+        let stamp = palette::theme_stamp(&dir);
+        if self.theme_dir.as_ref() != Some(&dir) || stamp != self.theme_stamp {
+            set_palette(palette::load());
+            self.theme_dir = Some(dir);
+            self.theme_stamp = stamp;
         }
     }
 
@@ -146,10 +176,14 @@ impl App {
         if let Some(ref mut collector) = self.macmon {
             let metrics = collector.get_latest();
             self.apple_stats = AppleSiliconStats::from_macmon(metrics);
+        } else if let Some(ref collector) = self.asahi {
+            let usage: Vec<f32> = self.sys.cpus().iter().map(|c| c.cpu_usage()).collect();
+            self.apple_stats = collector.sample(&usage);
         }
 
         // Update top processes
         self.update_top_processes();
+        self.follow_theme();
     }
 
     fn update_top_processes(&mut self) {
@@ -282,7 +316,7 @@ fn ui(f: &mut Frame, app: &App) {
 
     // Render footer
     let footer = LcarsFooter::new(
-        &[("[Q]", "TERMINATE", LCARS_ORANGE), ("[R]", "REFRESH", LCARS_BLUE)],
+        &[("[Q]", "TERMINATE", pal().primary), ("[R]", "REFRESH", pal().secondary)],
         &app.apple_stats.thermal_status,
     );
     f.render_widget(footer, main_chunks[2]);
@@ -344,15 +378,15 @@ fn render_sidebar(f: &mut Frame, area: Rect, _app: &App) {
     // Define sidebar buttons aligned with content panel heights
     // Heights must match: 5, 5, 4, 5, 4, 4, 5, 4, Min(remaining)
     let buttons = [
-        ("CPU", LCARS_ORANGE, 5u16),     // WARP NACELLES
-        ("GPU", LCARS_BLUE, 5u16),       // PLASMA CONDUIT
-        ("ANE", LCARS_PURPLE, 4u16),     // NEURAL MATRIX
-        ("PWR", LCARS_PEACH, 5u16),      // REACTOR OUTPUT
-        ("TMP", LCARS_YELLOW, 4u16),     // ENVIRONMENTAL
-        ("MEM", LCARS_BLUE, 4u16),       // SHIELD CAPACITY
-        ("NET", LCARS_PEACH, 5u16),      // SUBSPACE ARRAY
-        ("DSK", LCARS_PURPLE, 4u16),     // CARGO TRANSPORT
-        ("PRC", LCARS_TAN, 0u16),        // SENSOR ARRAY (fills remaining)
+        ("CPU", pal().primary, 5u16),     // WARP NACELLES
+        ("GPU", pal().secondary, 5u16),       // PLASMA CONDUIT
+        ("ANE", pal().tertiary, 4u16),     // NEURAL MATRIX
+        ("PWR", pal().soft, 5u16),      // REACTOR OUTPUT
+        ("TMP", pal().value, 4u16),     // ENVIRONMENTAL
+        ("MEM", pal().secondary, 4u16),       // SHIELD CAPACITY
+        ("NET", pal().soft, 5u16),      // SUBSPACE ARRAY
+        ("DSK", pal().tertiary, 4u16),     // CARGO TRANSPORT
+        ("PRC", pal().warm, 0u16),        // SENSOR ARRAY (fills remaining)
     ];
 
     let mut y_offset = 0u16;
@@ -380,7 +414,7 @@ fn render_sidebar(f: &mut Frame, area: Rect, _app: &App) {
 }
 
 fn render_warp_nacelles(f: &mut Frame, area: Rect, app: &App) {
-    let title = lcars_section_title("WARP NACELLES (CPU CLUSTERS)", LCARS_ORANGE);
+    let title = lcars_section_title("WARP NACELLES (CPU CLUSTERS)", pal().primary);
 
     let ecpu_pct = app.apple_stats.ecpu_usage_percent;
     let pcpu_pct = app.apple_stats.pcpu_usage_percent;
@@ -392,14 +426,14 @@ fn render_warp_nacelles(f: &mut Frame, area: Rect, app: &App) {
             Line::from(""), // Align with pill interior
             title,
             Line::from(vec![
-                Span::styled("P-CLUSTER: ", Style::default().fg(LCARS_ORANGE)),
+                Span::styled("P-CLUSTER: ", Style::default().fg(pal().primary)),
                 Span::styled(format!("{:.0}%", pcpu_pct), Style::default().fg(get_usage_color(pcpu_pct))),
-                Span::styled(format!("  @ {:.0} MHz", pcpu_freq), Style::default().fg(LCARS_YELLOW)),
+                Span::styled(format!("  @ {:.0} MHz", pcpu_freq), Style::default().fg(pal().value)),
             ]),
             Line::from(vec![
-                Span::styled("E-CLUSTER: ", Style::default().fg(LCARS_ORANGE)),
+                Span::styled("E-CLUSTER: ", Style::default().fg(pal().primary)),
                 Span::styled(format!("{:.0}%", ecpu_pct), Style::default().fg(get_usage_color(ecpu_pct))),
-                Span::styled(format!("  @ {:.0} MHz", ecpu_freq), Style::default().fg(LCARS_YELLOW)),
+                Span::styled(format!("  @ {:.0} MHz", ecpu_freq), Style::default().fg(pal().value)),
             ]),
         ]
     } else {
@@ -409,9 +443,9 @@ fn render_warp_nacelles(f: &mut Frame, area: Rect, app: &App) {
             Line::from(""), // Align with pill interior
             title,
             Line::from(vec![
-                Span::styled("AGGREGATE: ", Style::default().fg(LCARS_ORANGE)),
+                Span::styled("AGGREGATE: ", Style::default().fg(pal().primary)),
                 Span::styled(format!("{:.0}%", cpu_usage), Style::default().fg(get_usage_color(cpu_usage as f64))),
-                Span::styled(" (macmon unavailable)", Style::default().fg(LCARS_PEACH)),
+                Span::styled(" (macmon unavailable)", Style::default().fg(pal().soft)),
             ]),
         ]
     };
@@ -421,9 +455,15 @@ fn render_warp_nacelles(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_plasma_conduit(f: &mut Frame, area: Rect, app: &App) {
-    let title = lcars_section_title("PLASMA CONDUIT (GPU)", LCARS_BLUE);
+    let title = lcars_section_title("PLASMA CONDUIT (GPU)", pal().secondary);
 
-    let content = if app.apple_stats.available {
+    let content = if app.apple_stats.source == Source::Asahi {
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(Span::styled("NO TELEMETRY: the Asahi GPU driver exposes no load or clock counters", Style::default().fg(pal().soft))),
+        ]
+    } else if app.apple_stats.available {
         let gpu_pct = app.apple_stats.gpu_usage_percent;
         let gpu_freq = app.apple_stats.gpu_freq_mhz;
         let gpu_power = app.apple_stats.gpu_power_w;
@@ -432,18 +472,18 @@ fn render_plasma_conduit(f: &mut Frame, area: Rect, app: &App) {
             Line::from(""), // Align with pill interior
             title,
             Line::from(vec![
-                Span::styled("UTILIZATION: ", Style::default().fg(LCARS_BLUE)),
+                Span::styled("UTILIZATION: ", Style::default().fg(pal().secondary)),
                 Span::styled(format!("{:.0}%", gpu_pct), Style::default().fg(get_usage_color(gpu_pct))),
             ]),
             Line::from(vec![
-                Span::styled(format!("FREQ: {:.0} MHz  POWER: {:.1}W", gpu_freq, gpu_power), Style::default().fg(LCARS_YELLOW)),
+                Span::styled(format!("FREQ: {:.0} MHz  POWER: {:.1}W", gpu_freq, gpu_power), Style::default().fg(pal().value)),
             ]),
         ]
     } else {
         vec![
             Line::from(""), // Align with pill interior
             title,
-            Line::from(Span::styled("GPU metrics require macmon", Style::default().fg(LCARS_PEACH))),
+            Line::from(Span::styled("GPU metrics require macmon", Style::default().fg(pal().soft))),
         ]
     };
 
@@ -452,25 +492,31 @@ fn render_plasma_conduit(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_neural_matrix(f: &mut Frame, area: Rect, app: &App) {
-    let title = lcars_section_title("NEURAL MATRIX (ANE)", LCARS_PURPLE);
+    let title = lcars_section_title("NEURAL MATRIX (ANE)", pal().tertiary);
 
-    let content = if app.apple_stats.available {
+    let content = if app.apple_stats.source == Source::Asahi {
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(Span::styled("OFFLINE: no Linux driver for the Neural Engine", Style::default().fg(pal().soft))),
+        ]
+    } else if app.apple_stats.available {
         let ane_power = app.apple_stats.ane_power_w;
         let status = if ane_power > 0.1 { "ACTIVE" } else { "STANDBY" };
         vec![
             Line::from(""), // Align with pill interior
             title,
             Line::from(vec![
-                Span::styled("POWER: ", Style::default().fg(LCARS_PURPLE)),
-                Span::styled(format!("{:.2}W", ane_power), Style::default().fg(LCARS_YELLOW)),
-                Span::styled(format!("   STATUS: {}", status), Style::default().fg(if ane_power > 0.1 { LCARS_BLUE } else { LCARS_PEACH })),
+                Span::styled("POWER: ", Style::default().fg(pal().tertiary)),
+                Span::styled(format!("{:.2}W", ane_power), Style::default().fg(pal().value)),
+                Span::styled(format!("   STATUS: {}", status), Style::default().fg(if ane_power > 0.1 { pal().secondary } else { pal().soft })),
             ]),
         ]
     } else {
         vec![
             Line::from(""), // Align with pill interior
             title,
-            Line::from(Span::styled("ANE metrics require macmon", Style::default().fg(LCARS_PEACH))),
+            Line::from(Span::styled("ANE metrics require macmon", Style::default().fg(pal().soft))),
         ]
     };
 
@@ -479,30 +525,51 @@ fn render_neural_matrix(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_reactor_output(f: &mut Frame, area: Rect, app: &App) {
-    let title = lcars_section_title("REACTOR OUTPUT (POWER)", LCARS_PEACH);
+    let title = lcars_section_title("REACTOR OUTPUT (POWER)", pal().soft);
 
-    let content = if app.apple_stats.available {
+    let content = if app.apple_stats.source == Source::Asahi {
+        let s = &app.apple_stats;
+        let mut battery = vec![Span::styled("BATTERY: ", Style::default().fg(pal().tertiary))];
+        match s.battery_w {
+            Some(w) => {
+                battery.push(Span::styled(format!("{w:+.1}W"), Style::default().fg(pal().value)));
+                battery.push(Span::styled(format!("  {}", s.battery_status), Style::default().fg(pal().soft)));
+            }
+            None => battery.push(Span::styled("NO READING", Style::default().fg(pal().soft))),
+        }
         vec![
             Line::from(""), // Align with pill interior
             title,
             Line::from(vec![
-                Span::styled("CPU: ", Style::default().fg(LCARS_ORANGE)),
-                Span::styled(format!("{:.1}W", app.apple_stats.cpu_power_w), Style::default().fg(LCARS_YELLOW)),
-                Span::styled("  GPU: ", Style::default().fg(LCARS_BLUE)),
-                Span::styled(format!("{:.1}W", app.apple_stats.gpu_power_w), Style::default().fg(LCARS_YELLOW)),
+                Span::styled("SOC: ", Style::default().fg(pal().primary)),
+                Span::styled(format!("{:.1}W", s.soc_power_w), Style::default().fg(pal().value)),
+                Span::styled("  SYSTEM: ", Style::default().fg(pal().soft)),
+                Span::styled(format!("{:.1}W", s.sys_power_w), Style::default().fg(pal().value).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(battery),
+        ]
+    } else if app.apple_stats.available {
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(vec![
+                Span::styled("CPU: ", Style::default().fg(pal().primary)),
+                Span::styled(format!("{:.1}W", app.apple_stats.cpu_power_w), Style::default().fg(pal().value)),
+                Span::styled("  GPU: ", Style::default().fg(pal().secondary)),
+                Span::styled(format!("{:.1}W", app.apple_stats.gpu_power_w), Style::default().fg(pal().value)),
             ]),
             Line::from(vec![
-                Span::styled("ANE: ", Style::default().fg(LCARS_PURPLE)),
-                Span::styled(format!("{:.1}W", app.apple_stats.ane_power_w), Style::default().fg(LCARS_YELLOW)),
-                Span::styled("  TOTAL: ", Style::default().fg(LCARS_PEACH)),
-                Span::styled(format!("{:.1}W", app.apple_stats.sys_power_w), Style::default().fg(LCARS_YELLOW).add_modifier(Modifier::BOLD)),
+                Span::styled("ANE: ", Style::default().fg(pal().tertiary)),
+                Span::styled(format!("{:.1}W", app.apple_stats.ane_power_w), Style::default().fg(pal().value)),
+                Span::styled("  TOTAL: ", Style::default().fg(pal().soft)),
+                Span::styled(format!("{:.1}W", app.apple_stats.sys_power_w), Style::default().fg(pal().value).add_modifier(Modifier::BOLD)),
             ]),
         ]
     } else {
         vec![
             Line::from(""), // Align with pill interior
             title,
-            Line::from(Span::styled("Power metrics require macmon", Style::default().fg(LCARS_PEACH))),
+            Line::from(Span::styled("Power metrics require macmon", Style::default().fg(pal().soft))),
         ]
     };
 
@@ -511,24 +578,45 @@ fn render_reactor_output(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_environmental(f: &mut Frame, area: Rect, app: &App) {
-    let title = lcars_section_title("ENVIRONMENTAL CONTROLS (THERMAL)", LCARS_YELLOW);
+    let title = lcars_section_title("ENVIRONMENTAL CONTROLS (THERMAL)", pal().value);
+    let status_color = match app.apple_stats.thermal_status.as_str() {
+        "NOMINAL" => pal().secondary,
+        "ELEVATED" => pal().caution,
+        _ => pal().alert,
+    };
 
-    let content = if app.apple_stats.available {
+    let content = if app.apple_stats.source == Source::Asahi {
+        let mut spans = Vec::new();
+        for (label, temp) in &app.apple_stats.sensors {
+            spans.push(Span::styled(format!("{label}: "), Style::default().fg(pal().primary)));
+            spans.push(Span::styled(format!("{temp:.0}°C  "), Style::default().fg(get_temp_color(*temp))));
+        }
+        spans.push(Span::styled("STATUS: ", Style::default().fg(pal().soft)));
+        spans.push(Span::styled(
+            app.apple_stats.thermal_status.clone(),
+            Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+        ));
+        vec![
+            Line::from(""), // Align with pill interior
+            title,
+            Line::from(spans),
+        ]
+    } else if app.apple_stats.available {
         let cpu_temp = app.apple_stats.cpu_temp_c;
         let gpu_temp = app.apple_stats.gpu_temp_c;
         vec![
             Line::from(""), // Align with pill interior
             title,
             Line::from(vec![
-                Span::styled("CPU: ", Style::default().fg(LCARS_ORANGE)),
+                Span::styled("CPU: ", Style::default().fg(pal().primary)),
                 Span::styled(format!("{:.0}°C", cpu_temp), Style::default().fg(get_temp_color(cpu_temp))),
-                Span::styled("  GPU: ", Style::default().fg(LCARS_BLUE)),
+                Span::styled("  GPU: ", Style::default().fg(pal().secondary)),
                 Span::styled(format!("{:.0}°C", gpu_temp), Style::default().fg(get_temp_color(gpu_temp))),
-                Span::styled("  STATUS: ", Style::default().fg(LCARS_PEACH)),
+                Span::styled("  STATUS: ", Style::default().fg(pal().soft)),
                 Span::styled(&app.apple_stats.thermal_status, Style::default().fg(
-                    if app.apple_stats.thermal_status == "NOMINAL" { LCARS_BLUE }
-                    else if app.apple_stats.thermal_status == "ELEVATED" { LCARS_YELLOW }
-                    else { LCARS_RED }
+                    if app.apple_stats.thermal_status == "NOMINAL" { pal().secondary }
+                    else if app.apple_stats.thermal_status == "ELEVATED" { pal().caution }
+                    else { pal().alert }
                 ).add_modifier(Modifier::BOLD)),
             ]),
         ]
@@ -536,7 +624,7 @@ fn render_environmental(f: &mut Frame, area: Rect, app: &App) {
         vec![
             Line::from(""), // Align with pill interior
             title,
-            Line::from(Span::styled("Temperature metrics require macmon", Style::default().fg(LCARS_PEACH))),
+            Line::from(Span::styled("Temperature metrics require macmon", Style::default().fg(pal().soft))),
         ]
     };
 
@@ -545,7 +633,7 @@ fn render_environmental(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_shield_capacity(f: &mut Frame, area: Rect, app: &App) {
-    let title = lcars_section_title("SHIELD CAPACITY (MEMORY)", LCARS_BLUE);
+    let title = lcars_section_title("SHIELD CAPACITY (MEMORY)", pal().secondary);
 
     let total_mem = app.sys.total_memory();
     let used_mem = app.sys.used_memory();
@@ -562,7 +650,7 @@ fn render_shield_capacity(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(format!("{:.1}%", percent), Style::default().fg(get_usage_color(percent))),
             Span::styled(format!("  ({:.2} GB / {:.2} GB)",
                 used_mem as f64 / 1_073_741_824.0,
-                total_mem as f64 / 1_073_741_824.0), Style::default().fg(LCARS_YELLOW)),
+                total_mem as f64 / 1_073_741_824.0), Style::default().fg(pal().value)),
         ]),
     ];
 
@@ -571,7 +659,7 @@ fn render_shield_capacity(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_subspace_array(f: &mut Frame, area: Rect, app: &App) {
-    let title = lcars_section_title("SUBSPACE ARRAY (NETWORK)", LCARS_PEACH);
+    let title = lcars_section_title("SUBSPACE ARRAY (NETWORK)", pal().soft);
 
     let rx_gb = app.network_stats.rx_bytes as f64 / 1_073_741_824.0;
     let tx_gb = app.network_stats.tx_bytes as f64 / 1_073_741_824.0;
@@ -582,14 +670,14 @@ fn render_subspace_array(f: &mut Frame, area: Rect, app: &App) {
         Line::from(""), // Align with pill interior
         title,
         Line::from(vec![
-            Span::styled("▼ RX: ", Style::default().fg(LCARS_YELLOW)),
-            Span::styled(format!("{:.2} GB", rx_gb), Style::default().fg(LCARS_BLUE)),
-            Span::styled(format!(" [{:.1} MB/s]", rx_speed), Style::default().fg(LCARS_PURPLE)),
+            Span::styled("▼ RX: ", Style::default().fg(pal().value)),
+            Span::styled(format!("{:.2} GB", rx_gb), Style::default().fg(pal().secondary)),
+            Span::styled(format!(" [{:.1} MB/s]", rx_speed), Style::default().fg(pal().tertiary)),
         ]),
         Line::from(vec![
-            Span::styled("▲ TX: ", Style::default().fg(LCARS_YELLOW)),
-            Span::styled(format!("{:.2} GB", tx_gb), Style::default().fg(LCARS_BLUE)),
-            Span::styled(format!(" [{:.1} MB/s]", tx_speed), Style::default().fg(LCARS_PURPLE)),
+            Span::styled("▲ TX: ", Style::default().fg(pal().value)),
+            Span::styled(format!("{:.2} GB", tx_gb), Style::default().fg(pal().secondary)),
+            Span::styled(format!(" [{:.1} MB/s]", tx_speed), Style::default().fg(pal().tertiary)),
 
         ])
     ];
@@ -599,7 +687,7 @@ fn render_subspace_array(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_cargo_transport(f: &mut Frame, area: Rect, app: &App) {
-    let title = lcars_section_title("CARGO TRANSPORT (DISK I/O)", LCARS_PURPLE);
+    let title = lcars_section_title("CARGO TRANSPORT (DISK I/O)", pal().tertiary);
 
     let read_speed = app.disk_stats.read_speed / 1_048_576.0; // MB/s
     let write_speed = app.disk_stats.write_speed / 1_048_576.0;
@@ -608,10 +696,10 @@ fn render_cargo_transport(f: &mut Frame, area: Rect, app: &App) {
         Line::from(""), // Align with pill interior
         title,
         Line::from(vec![
-            Span::styled("READ: ", Style::default().fg(LCARS_YELLOW)),
-            Span::styled(format!("{:.1} MB/s", read_speed), Style::default().fg(LCARS_BLUE)),
-            Span::styled("  WRITE: ", Style::default().fg(LCARS_YELLOW)),
-            Span::styled(format!("{:.1} MB/s", write_speed), Style::default().fg(LCARS_BLUE)),
+            Span::styled("READ: ", Style::default().fg(pal().value)),
+            Span::styled(format!("{:.1} MB/s", read_speed), Style::default().fg(pal().secondary)),
+            Span::styled("  WRITE: ", Style::default().fg(pal().value)),
+            Span::styled(format!("{:.1} MB/s", write_speed), Style::default().fg(pal().secondary)),
         ]),
     ];
 
@@ -620,7 +708,7 @@ fn render_cargo_transport(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_sensor_array(f: &mut Frame, area: Rect, app: &App) {
-    let title = lcars_section_title("SENSOR ARRAY (TOP PROCESSES)", LCARS_TAN);
+    let title = lcars_section_title("SENSOR ARRAY (TOP PROCESSES)", pal().warm);
 
     let mut lines = vec![
         Line::from(""), // Align with pill interior
@@ -631,9 +719,9 @@ fn render_sensor_array(f: &mut Frame, area: Rect, app: &App) {
         let name: String = proc.name.chars().take(15).collect();
         let mem_mb = proc.memory_bytes as f64 / 1_048_576.0;
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<15}", name), Style::default().fg(LCARS_YELLOW)),
+            Span::styled(format!("{:<15}", name), Style::default().fg(pal().value)),
             Span::styled(format!(" CPU: {:>5.1}%", proc.cpu_percent), Style::default().fg(get_usage_color(proc.cpu_percent as f64))),
-            Span::styled(format!("  MEM: {:>7.1} MB", mem_mb), Style::default().fg(LCARS_BLUE)),
+            Span::styled(format!("  MEM: {:>7.1} MB", mem_mb), Style::default().fg(pal().secondary)),
         ]));
     }
 
