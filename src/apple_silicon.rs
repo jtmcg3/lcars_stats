@@ -70,11 +70,31 @@ pub struct MacmonMetrics {
     pub sys_power: f64,
 }
 
+/// Where the Apple Silicon metrics came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Source {
+    /// `macmon pipe` on macOS.
+    #[default]
+    Macmon,
+    /// Linux sysfs on Asahi (cpufreq + macsmc hwmon). No GPU or ANE telemetry.
+    Asahi,
+}
+
 /// Processed Apple Silicon metrics for display
 #[derive(Debug, Clone, Default)]
 pub struct AppleSiliconStats {
-    /// Whether macmon is available
+    /// Whether a metrics source (macmon or Asahi sysfs) is available
     pub available: bool,
+    /// Which collector produced these numbers
+    pub source: Source,
+    /// SoC package power in Watts (Asahi: SMC "Heatpipe Power")
+    pub soc_power_w: f64,
+    /// Battery power flow in Watts; negative while discharging (Asahi only)
+    pub battery_w: Option<f64>,
+    /// Battery state as reported by the kernel, e.g. "Discharging" (Asahi only)
+    pub battery_status: String,
+    /// Named temperature sensors in Celsius (Asahi only)
+    pub sensors: Vec<(String, f64)>,
     /// E-cluster (efficiency cores) frequency in MHz
     pub ecpu_freq_mhz: f64,
     /// E-cluster usage as percentage (0-100)
@@ -146,6 +166,7 @@ impl AppleSiliconStats {
             cpu_temp_c: cpu_temp,
             gpu_temp_c: gpu_temp,
             thermal_status,
+            ..Default::default()
         }
     }
 

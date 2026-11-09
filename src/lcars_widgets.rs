@@ -16,15 +16,61 @@ use ratatui::{
     widgets::Widget,
 };
 
-// LCARS color palette - authentic TNG colors
-pub const LCARS_ORANGE: Color = Color::Rgb(255, 153, 0);
-pub const LCARS_BLUE: Color = Color::Rgb(153, 153, 255);
-pub const LCARS_PURPLE: Color = Color::Rgb(204, 153, 255);
-pub const LCARS_PEACH: Color = Color::Rgb(255, 204, 153);
-pub const LCARS_RED: Color = Color::Rgb(204, 102, 102);
-pub const LCARS_YELLOW: Color = Color::Rgb(255, 255, 153);
-pub const LCARS_TAN: Color = Color::Rgb(204, 153, 102);
-pub const LCARS_LAVENDER: Color = Color::Rgb(153, 153, 204);
+use std::sync::RwLock;
+
+/// LCARS colour roles. The defaults are the authentic TNG palette; a theme can
+/// replace them at runtime (see `crate::palette`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Palette {
+    /// Frame, header and the CPU panel (TNG orange).
+    pub primary: Color,
+    /// Secondary frame colour and "healthy" readings (TNG blue).
+    pub secondary: Color,
+    /// Third frame colour (TNG purple).
+    pub tertiary: Color,
+    /// Soft accent for labels and notes (TNG peach).
+    pub soft: Color,
+    /// Earthy accent (TNG tan).
+    pub warm: Color,
+    /// Quiet accent (TNG lavender).
+    pub quiet: Color,
+    /// Numeric readouts (TNG yellow).
+    pub value: Color,
+    /// Usage/temperature band 2 (TNG yellow).
+    pub caution: Color,
+    /// Usage/temperature band 3 (TNG peach).
+    pub warning: Color,
+    /// Critical band and errors (TNG red).
+    pub alert: Color,
+}
+
+impl Palette {
+    pub const TNG: Palette = Palette {
+        primary: Color::Rgb(255, 153, 0),
+        secondary: Color::Rgb(153, 153, 255),
+        tertiary: Color::Rgb(204, 153, 255),
+        soft: Color::Rgb(255, 204, 153),
+        warm: Color::Rgb(204, 153, 102),
+        quiet: Color::Rgb(153, 153, 204),
+        value: Color::Rgb(255, 255, 153),
+        caution: Color::Rgb(255, 255, 153),
+        warning: Color::Rgb(255, 204, 153),
+        alert: Color::Rgb(204, 102, 102),
+    };
+}
+
+static PALETTE: RwLock<Palette> = RwLock::new(Palette::TNG);
+
+/// The active palette.
+pub fn pal() -> Palette {
+    *PALETTE.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Replace the active palette (e.g. after the desktop theme changes).
+pub fn set_palette(p: Palette) {
+    *PALETTE.write().unwrap_or_else(|e| e.into_inner()) = p;
+}
+
 pub const LCARS_BG: Color = Color::Reset;
 
 /// A sidebar button for the LCARS interface
@@ -218,11 +264,11 @@ pub fn draw_lcars_header(buf: &mut Buffer, area: Rect, title: &str, stardate: &s
 
     // Top border with rounded corners
     let y = area.y;
-    buf[(area.x, y)].set_char('╭').set_fg(LCARS_ORANGE);
+    buf[(area.x, y)].set_char('╭').set_fg(pal().primary);
     for x in 1..area.width - 1 {
-        buf[(area.x + x, y)].set_char('─').set_fg(LCARS_ORANGE);
+        buf[(area.x + x, y)].set_char('─').set_fg(pal().primary);
     }
-    buf[(area.x + area.width - 1, y)].set_char('╮').set_fg(LCARS_ORANGE);
+    buf[(area.x + area.width - 1, y)].set_char('╮').set_fg(pal().primary);
 
     if area.height < 2 {
         return;
@@ -230,15 +276,15 @@ pub fn draw_lcars_header(buf: &mut Buffer, area: Rect, title: &str, stardate: &s
 
     // Content line with pill buttons
     let y = area.y + 1;
-    buf[(area.x, y)].set_char('│').set_fg(LCARS_ORANGE);
+    buf[(area.x, y)].set_char('│').set_fg(pal().primary);
 
     // Orange pill
     for x in 1..4 {
         if area.x + x < area.x + area.width - 1 {
             buf[(area.x + x, y)]
                 .set_char('█')
-                .set_fg(LCARS_ORANGE)
-                .set_bg(LCARS_ORANGE);
+                .set_fg(pal().primary)
+                .set_bg(pal().primary);
         }
     }
 
@@ -248,7 +294,7 @@ pub fn draw_lcars_header(buf: &mut Buffer, area: Rect, title: &str, stardate: &s
         area.x + title_start,
         y,
         title,
-        Style::default().fg(LCARS_ORANGE).add_modifier(Modifier::BOLD),
+        Style::default().fg(pal().primary).add_modifier(Modifier::BOLD),
     );
 
     // Blue pill
@@ -257,8 +303,8 @@ pub fn draw_lcars_header(buf: &mut Buffer, area: Rect, title: &str, stardate: &s
         if area.x + blue_start + x < area.x + area.width - 1 {
             buf[(area.x + blue_start + x, y)]
                 .set_char('█')
-                .set_fg(LCARS_BLUE)
-                .set_bg(LCARS_BLUE);
+                .set_fg(pal().secondary)
+                .set_bg(pal().secondary);
         }
     }
 
@@ -270,11 +316,11 @@ pub fn draw_lcars_header(buf: &mut Buffer, area: Rect, title: &str, stardate: &s
             area.x + stardate_start,
             y,
             &stardate_label,
-            Style::default().fg(LCARS_BLUE),
+            Style::default().fg(pal().secondary),
         );
     }
 
-    buf[(area.x + area.width - 1, y)].set_char('│').set_fg(LCARS_ORANGE);
+    buf[(area.x + area.width - 1, y)].set_char('│').set_fg(pal().primary);
 
     if area.height < 3 {
         return;
@@ -282,11 +328,11 @@ pub fn draw_lcars_header(buf: &mut Buffer, area: Rect, title: &str, stardate: &s
 
     // Bottom border
     let y = area.y + 2;
-    buf[(area.x, y)].set_char('├').set_fg(LCARS_ORANGE);
+    buf[(area.x, y)].set_char('├').set_fg(pal().primary);
     for x in 1..area.width - 1 {
-        buf[(area.x + x, y)].set_char('─').set_fg(LCARS_ORANGE);
+        buf[(area.x + x, y)].set_char('─').set_fg(pal().primary);
     }
-    buf[(area.x + area.width - 1, y)].set_char('┤').set_fg(LCARS_ORANGE);
+    buf[(area.x + area.width - 1, y)].set_char('┤').set_fg(pal().primary);
 }
 
 /// Draw LCARS-style footer bar
@@ -296,18 +342,18 @@ pub fn draw_lcars_footer(buf: &mut Buffer, area: Rect, items: &[(&str, Color)], 
     }
 
     let y = area.y;
-    buf[(area.x, y)].set_char('├').set_fg(LCARS_ORANGE);
+    buf[(area.x, y)].set_char('├').set_fg(pal().primary);
     for x in 1..area.width - 1 {
-        buf[(area.x + x, y)].set_char('─').set_fg(LCARS_ORANGE);
+        buf[(area.x + x, y)].set_char('─').set_fg(pal().primary);
     }
-    buf[(area.x + area.width - 1, y)].set_char('┤').set_fg(LCARS_ORANGE);
+    buf[(area.x + area.width - 1, y)].set_char('┤').set_fg(pal().primary);
 
     if area.height < 2 {
         return;
     }
 
     let y = area.y + 1;
-    buf[(area.x, y)].set_char('╰').set_fg(LCARS_ORANGE);
+    buf[(area.x, y)].set_char('╰').set_fg(pal().primary);
 
     let mut x_pos = area.x + 1;
     for (label, color) in items {
@@ -336,23 +382,23 @@ pub fn draw_lcars_footer(buf: &mut Buffer, area: Rect, items: &[(&str, Color)], 
         for i in 0..3 {
             buf[(status_x - 4 + i, y)]
                 .set_char('█')
-                .set_fg(LCARS_BLUE)
-                .set_bg(LCARS_BLUE);
+                .set_fg(pal().secondary)
+                .set_bg(pal().secondary);
         }
         buf.set_string(
             status_x,
             y,
             &status_text,
-            Style::default().fg(LCARS_YELLOW).add_modifier(Modifier::BOLD),
+            Style::default().fg(pal().value).add_modifier(Modifier::BOLD),
         );
     }
 
     // Fill remaining with dashes
     for x in x_pos..status_x.saturating_sub(5) {
-        buf[(x, y)].set_char('─').set_fg(LCARS_ORANGE);
+        buf[(x, y)].set_char('─').set_fg(pal().primary);
     }
 
-    buf[(area.x + area.width - 1, y)].set_char('╯').set_fg(LCARS_ORANGE);
+    buf[(area.x + area.width - 1, y)].set_char('╯').set_fg(pal().primary);
 }
 
 /// Create a section title line in LCARS style
@@ -369,23 +415,25 @@ pub fn lcars_section_title(title: &str, color: Color) -> Line<'static> {
 
 /// Get color based on usage percentage
 pub fn get_usage_color(percent: f64) -> Color {
+    let p = pal();
     match percent as u16 {
-        0..=50 => LCARS_BLUE,
-        51..=75 => LCARS_YELLOW,
-        76..=90 => LCARS_PEACH,
-        _ => LCARS_RED,
+        0..=50 => p.secondary,
+        51..=75 => p.caution,
+        76..=90 => p.warning,
+        _ => p.alert,
     }
 }
 
 /// Get color for temperature
 pub fn get_temp_color(temp_c: f64) -> Color {
+    let p = pal();
     if temp_c > 95.0 {
-        LCARS_RED
+        p.alert
     } else if temp_c > 85.0 {
-        LCARS_PEACH
+        p.warning
     } else if temp_c > 70.0 {
-        LCARS_YELLOW
+        p.caution
     } else {
-        LCARS_BLUE
+        p.secondary
     }
 }
